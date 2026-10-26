@@ -133,6 +133,10 @@ The `overlay/` directory adds patterns specific to **Prisma + Express + Vite Rea
 
 These are optional — the base templates work for any containerized web application.
 
+## Contributing
+
+This is a v1 and feedback is welcome: wrong defaults, missing hardening steps, better approaches, or "I ran guide X and it broke here". See [CONTRIBUTING.md](CONTRIBUTING.md) and the open issues labelled `help wanted`. Contributors are credited in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE). Provided as-is: review every manifest and harden it for your own environment before using it in production.

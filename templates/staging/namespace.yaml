@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}
+    environment: staging

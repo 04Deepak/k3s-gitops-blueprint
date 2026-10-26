@@ -1,0 +1,64 @@
+# Staging ArgoCD Applications — backend + frontend + infra
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-staging-backend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: staging/backend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{STAGING_NAMESPACE}}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-staging-frontend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: staging/frontend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{STAGING_NAMESPACE}}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-staging-infra
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{STAGING_NAMESPACE}}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

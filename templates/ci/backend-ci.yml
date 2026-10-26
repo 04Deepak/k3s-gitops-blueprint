@@ -1,0 +1,274 @@
+# Backend CI/CD Pipeline
+# Copy to: <your-backend-repo>/.github/workflows/ci.yml
+#
+# Required GitHub Secrets:
+#   GITOPS_PAT        — GitHub PAT with packages:write + repo scope on the devops repo
+#   DEPLOY_SSH_KEY    — SSH private key for the server (deploy user)
+#
+# Required GitHub Variables (repo-level):
+#   CI_RUNNER         — (optional) set to "self-hosted" to use self-hosted runners
+
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NODE_VERSION: "22"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: "{{BACKEND_IMAGE}}"
+
+jobs:
+  # ─── Unit Tests + Lint + Build ───────────────────────────────────────
+  test:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck
+        run: npx tsc -b --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # ─── Integration Tests (real database) ──────────────────────────────
+  integration-db:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: test_db
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U test_user"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    env:
+      DATABASE_URL: postgresql://test_user:test_password@localhost:55432/test_db
+      DIRECT_URL: postgresql://test_user:test_password@localhost:55432/test_db
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run database migrations
+        run: npx prisma migrate deploy
+
+      - name: Run integration tests
+        run: npm run test:db
+
+  # ─── Build & Push Docker Image ──────────────────────────────────────
+  build-push:
+    needs: [test, integration-db]
+    if: github.event_name == 'push'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Isolate Docker config to avoid macOS Keychain issues on self-hosted runners
+      - name: Isolate Docker config
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/.docker-isolated"
+          mkdir -p "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITOPS_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.short_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── Deploy to Staging (on push to dev) ─────────────────────────────
+  deploy-staging:
+    needs: build-push
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    concurrency:
+      group: deploy-staging-backend
+      cancel-in-progress: false
+    env:
+      SHORT_SHA: ${{ needs.build-push.outputs.short_sha }}
+    steps:
+      - name: Clone devops repo
+        run: |
+          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/{{GH_REPO_OWNER}}/{{DEVOPS_REPO_NAME}}.git devops
+          cd devops
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update staging image tag
+        working-directory: devops
+        run: |
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+          # Update deployment
+          perl -pi -e "s|image: \Q${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\E:\S+|image: ${NEW_IMAGE}|g" \
+            staging/backend/deployment.yaml
+
+          # Update CronJobs (same image)
+          perl -pi -e "s|image: \Q${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\E:\S+|image: ${NEW_IMAGE}|g" \
+            staging/backend/cronjobs.yaml
+
+      # Git push with rebase + 3-attempt retry.
+      # Another workflow (frontend deploy) may push concurrently — rebase handles that.
+      # The explicit exit 1 guard ensures the job FAILS if all retries exhaust
+      # (without it, the loop exits 0 and the deploy silently reports success).
+      - name: Push manifest update
+        working-directory: devops
+        run: |
+          git add -A
+          git commit -m "ci(staging): backend image ${SHORT_SHA}" || exit 0
+
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt $i/$MAX_RETRIES..."
+            if git push origin main; then
+              echo "Push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Push failed, rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "ERROR: All $MAX_RETRIES push attempts failed"
+          exit 1
+
+  # ─── Deploy to Production (on push to main) ─────────────────────────
+  deploy-prod:
+    needs: build-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    concurrency:
+      group: deploy-prod-backend
+      cancel-in-progress: false
+    env:
+      SHORT_SHA: ${{ needs.build-push.outputs.short_sha }}
+    steps:
+      - name: Clone devops repo
+        run: |
+          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/{{GH_REPO_OWNER}}/{{DEVOPS_REPO_NAME}}.git devops
+          cd devops
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update prod image tag
+        working-directory: devops
+        run: |
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+          # Update deployment
+          perl -pi -e "s|image: \Q${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\E:\S+|image: ${NEW_IMAGE}|g" \
+            backend/deployment.yaml
+
+          # Update CronJobs (same image as deployment)
+          perl -pi -e "s|image: \Q${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\E:\S+|image: ${NEW_IMAGE}|g" \
+            backend/cronjobs.yaml
+
+      - name: Push manifest update
+        working-directory: devops
+        run: |
+          git add -A
+          git commit -m "ci(prod): backend image ${SHORT_SHA}" || exit 0
+
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt $i/$MAX_RETRIES..."
+            if git push origin main; then
+              echo "Push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Push failed, rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "ERROR: All $MAX_RETRIES push attempts failed"
+          exit 1
+
+      # Explicit ArgoCD sync for prod (don't wait for auto-sync interval)
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H {{SERVER_IP}} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Trigger ArgoCD sync
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no {{SSH_USER}}@{{SERVER_IP}} '
+            kubectl exec deployment/argocd-server -n argocd -- \
+              argocd login localhost:8080 --plaintext \
+                --username admin \
+                --password "$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)" && \
+            kubectl exec deployment/argocd-server -n argocd -- \
+              argocd app sync {{PROJECT_NAME}}-backend --plaintext && \
+            kubectl exec deployment/argocd-server -n argocd -- \
+              argocd app wait {{PROJECT_NAME}}-backend --plaintext --timeout 300
+          '

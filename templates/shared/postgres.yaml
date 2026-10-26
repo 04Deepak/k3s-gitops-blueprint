@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: shared
+data:
+  init-databases.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "Creating application databases and scoped users..."
+
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      -- Create staging database
+      SELECT 'CREATE DATABASE {{DB_STAGING_NAME}}'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{{DB_STAGING_NAME}}');
+      \gexec
+
+      -- Create application user with limited privileges
+      DO \$\$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{DB_USER}}') THEN
+          CREATE ROLE {{DB_USER}} WITH LOGIN PASSWORD '{{DB_PASSWORD}}';
+        END IF;
+      END
+      \$\$;
+
+      -- Grant privileges on production database
+      GRANT CONNECT ON DATABASE {{DB_NAME}} TO {{DB_USER}};
+      \c {{DB_NAME}}
+      GRANT USAGE ON SCHEMA public TO {{DB_USER}};
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {{DB_USER}};
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {{DB_USER}};
+
+      -- Grant privileges on staging database
+      \c {{DB_STAGING_NAME}}
+      GRANT CONNECT ON DATABASE {{DB_STAGING_NAME}} TO {{DB_USER}};
+      GRANT USAGE ON SCHEMA public TO {{DB_USER}};
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {{DB_USER}};
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {{DB_USER}};
+
+      -- Set connection limits
+      ALTER ROLE {{DB_USER}} CONNECTION LIMIT 50;
+    EOSQL
+
+    echo "Database initialization complete."
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: shared
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_USER
+              value: "{{DB_SUPERUSER}}"
+            - name: POSTGRES_PASSWORD
+              value: "{{DB_SUPERUSER_PASSWORD}}"
+            - name: POSTGRES_DB
+              value: "{{DB_NAME}}"
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - "{{DB_SUPERUSER}}"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - "{{DB_SUPERUSER}}"
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+              subPath: pgdata
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgres-init
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: shared
+  labels:
+    app: postgres
+spec:
+  type: ClusterIP
+  clusterIP: "{{POSTGRES_CLUSTERIP}}"
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: postgres

@@ -1,0 +1,19 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{PROJECT_NAME}}-backend-hpa
+  namespace: {{NAMESPACE}}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{PROJECT_NAME}}-backend
+  minReplicas: {{BACKEND_MIN_REPLICAS}}
+  maxReplicas: {{BACKEND_MAX_REPLICAS}}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{BACKEND_CPU_TARGET}}

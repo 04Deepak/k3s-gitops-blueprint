@@ -1,0 +1,169 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{PROJECT_NAME}}-backend
+  namespace: {{NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-backend
+  annotations:
+    secrets.infisical.com/auto-reload: "true"
+spec:
+  replicas: {{BACKEND_MIN_REPLICAS}}
+  selector:
+    matchLabels:
+      app: {{PROJECT_NAME}}-backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: {{PROJECT_NAME}}-backend
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: backend
+          image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+          ports:
+            - containerPort: {{BACKEND_PORT}}
+              name: http
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: DATABASE_URL
+            - name: DIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: DIRECT_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: REDIS_URL
+          envFrom:
+            - secretRef:
+                name: backend-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: {{BACKEND_MEMORY_REQUEST}}
+            limits:
+              cpu: 1500m
+              memory: {{BACKEND_MEMORY_LIMIT}}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{BACKEND_PORT}}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: {{BACKEND_PORT}}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: {{NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-backend
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{BACKEND_PORT}}
+      targetPort: {{BACKEND_PORT}}
+      name: http
+  selector:
+    app: {{PROJECT_NAME}}-backend
+---
+# ArgoCD PreSync hook — runs migrations BEFORE new pods roll out
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backend-migrate
+  namespace: {{NAMESPACE}}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: {{PROJECT_NAME}}-migrate
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+          command: ["npx", "prisma", "migrate", "deploy"]
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: backend-secrets
+                  key: DIRECT_URL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+# ArgoCD PostSync hook — seeds data AFTER deployment is healthy
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backend-seed
+  namespace: {{NAMESPACE}}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  activeDeadlineSeconds: 120
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: {{PROJECT_NAME}}-seed
+    spec:
+      imagePullSecrets:
+        - name: ghcr-secret
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+          command: ["npx", "tsx", "prisma/seed.ts"]
+          env:
+            - name: NODE_ENV
+              value: "production"
+          envFrom:
+            - secretRef:
+                name: backend-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

@@ -1,0 +1,44 @@
+# Production ArgoCD Applications — backend + frontend
+# ArgoCD watches the devops repo and auto-syncs changes.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-backend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: backend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{NAMESPACE}}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-frontend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: frontend
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {{NAMESPACE}}
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

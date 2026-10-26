@@ -1,0 +1,320 @@
+# Staging CronJobs — identical structure to prod, same image
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-broadcast-recovery
+  namespace: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-cron
+    job: broadcast-recovery
+    environment: staging
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 200
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 240
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-cron
+            job: broadcast-recovery
+        spec:
+          imagePullSecrets:
+            - name: ghcr-secret
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+              command: ["node", "dist/jobs/runner.js", "broadcast-recovery"]
+              env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DATABASE_URL
+                - name: DIRECT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DIRECT_URL
+              envFrom:
+                - secretRef:
+                    name: backend-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-tat-scheduler
+  namespace: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-cron
+    job: tat-scheduler
+    environment: staging
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-cron
+            job: tat-scheduler
+        spec:
+          imagePullSecrets:
+            - name: ghcr-secret
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+              command: ["node", "dist/jobs/runner.js", "tat-scheduler"]
+              env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DATABASE_URL
+                - name: DIRECT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DIRECT_URL
+              envFrom:
+                - secretRef:
+                    name: backend-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-consent-cleanup
+  namespace: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-cron
+    job: consent-cleanup
+    environment: staging
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 300
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-cron
+            job: consent-cleanup
+        spec:
+          imagePullSecrets:
+            - name: ghcr-secret
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+              command: ["node", "dist/jobs/runner.js", "consent-cleanup"]
+              env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DATABASE_URL
+                - name: DIRECT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DIRECT_URL
+              envFrom:
+                - secretRef:
+                    name: backend-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 384Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-insurance-expiry
+  namespace: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-cron
+    job: insurance-expiry
+    environment: staging
+spec:
+  schedule: "0 8 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-cron
+            job: insurance-expiry
+        spec:
+          imagePullSecrets:
+            - name: ghcr-secret
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+              command: ["node", "dist/jobs/runner.js", "insurance-expiry"]
+              env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DATABASE_URL
+                - name: DIRECT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DIRECT_URL
+              envFrom:
+                - secretRef:
+                    name: backend-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-account-purge
+  namespace: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-cron
+    job: account-purge
+    environment: staging
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 1800
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-cron
+            job: account-purge
+        spec:
+          imagePullSecrets:
+            - name: ghcr-secret
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+              command: ["node", "dist/jobs/runner.js", "account-purge"]
+              env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DATABASE_URL
+                - name: DIRECT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DIRECT_URL
+              envFrom:
+                - secretRef:
+                    name: backend-secrets
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 1000m
+                  memory: 1024Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backend-session-cleanup
+  namespace: {{STAGING_NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-cron
+    job: session-cleanup
+    environment: staging
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 120
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-cron
+            job: session-cleanup
+        spec:
+          imagePullSecrets:
+            - name: ghcr-secret
+          restartPolicy: Never
+          containers:
+            - name: job
+              image: {{BACKEND_IMAGE}}:{{IMAGE_TAG}}
+              command: ["node", "dist/jobs/runner.js", "session-cleanup"]
+              env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DATABASE_URL
+                - name: DIRECT_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backend-secrets
+                      key: DIRECT_URL
+              envFrom:
+                - secretRef:
+                    name: backend-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi

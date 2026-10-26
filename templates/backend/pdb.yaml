@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{PROJECT_NAME}}-backend-pdb
+  namespace: {{NAMESPACE}}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: {{PROJECT_NAME}}-backend

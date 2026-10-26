@@ -1,0 +1,194 @@
+# Frontend CI/CD Pipeline
+# Copy to: <your-frontend-repo>/.github/workflows/ci.yml
+#
+# Required GitHub Secrets:
+#   GITOPS_PAT        — GitHub PAT with packages:write + repo scope on the devops repo
+#
+# Required GitHub Variables (repo-level):
+#   CI_RUNNER         — (optional) set to "self-hosted" to use self-hosted runners
+
+name: Frontend CI/CD
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NODE_VERSION: "22"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: "{{FRONTEND_IMAGE}}"
+
+jobs:
+  # ─── Tests + Lint + Build ────────────────────────────────────────────
+  test:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+  # ─── Build & Push Docker Image ──────────────────────────────────────
+  build-push:
+    needs: [test]
+    if: github.event_name == 'push'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Isolate Docker config
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/.docker-isolated"
+          mkdir -p "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITOPS_PAT }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.short_sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            VITE_API_BASE_URL=/api
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── Deploy to Staging (on push to dev) ─────────────────────────────
+  deploy-staging:
+    needs: build-push
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    concurrency:
+      group: deploy-staging-frontend
+      cancel-in-progress: false
+    env:
+      SHORT_SHA: ${{ needs.build-push.outputs.short_sha }}
+    steps:
+      - name: Clone devops repo
+        run: |
+          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/{{GH_REPO_OWNER}}/{{DEVOPS_REPO_NAME}}.git devops
+          cd devops
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update staging image tag
+        working-directory: devops
+        run: |
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+          perl -pi -e "s|image: \Q${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\E:\S+|image: ${NEW_IMAGE}|g" \
+            staging/frontend/deployment.yaml
+
+      - name: Push manifest update
+        working-directory: devops
+        run: |
+          git add -A
+          git commit -m "ci(staging): frontend image ${SHORT_SHA}" || exit 0
+
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt $i/$MAX_RETRIES..."
+            if git push origin main; then
+              echo "Push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Push failed, rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "ERROR: All $MAX_RETRIES push attempts failed"
+          exit 1
+
+  # ─── Deploy to Production (on push to main) ─────────────────────────
+  # Frontend relies on ArgoCD auto-sync — no explicit SSH/sync step.
+  # ArgoCD detects the manifest change and rolls out automatically.
+  deploy-prod:
+    needs: build-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    concurrency:
+      group: deploy-prod-frontend
+      cancel-in-progress: false
+    env:
+      SHORT_SHA: ${{ needs.build-push.outputs.short_sha }}
+    steps:
+      - name: Clone devops repo
+        run: |
+          git clone https://x-access-token:${{ secrets.GITOPS_PAT }}@github.com/{{GH_REPO_OWNER}}/{{DEVOPS_REPO_NAME}}.git devops
+          cd devops
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update prod image tag
+        working-directory: devops
+        run: |
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+          perl -pi -e "s|image: \Q${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\E:\S+|image: ${NEW_IMAGE}|g" \
+            frontend/deployment.yaml
+
+      - name: Push manifest update
+        working-directory: devops
+        run: |
+          git add -A
+          git commit -m "ci(prod): frontend image ${SHORT_SHA}" || exit 0
+
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt $i/$MAX_RETRIES..."
+            if git push origin main; then
+              echo "Push succeeded on attempt $i"
+              exit 0
+            fi
+            echo "Push failed, rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "ERROR: All $MAX_RETRIES push attempts failed"
+          exit 1

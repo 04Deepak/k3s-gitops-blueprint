@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{PROJECT_NAME}}-db-backup
+  namespace: {{NAMESPACE}}
+  labels:
+    app: {{PROJECT_NAME}}-backup
+spec:
+  schedule: "0 20 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 900
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: {{PROJECT_NAME}}-backup
+        spec:
+          restartPolicy: Never
+          initContainers:
+            - name: pg-dump
+              image: postgres:16-alpine
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  FILENAME="{{DB_NAME}}_${TIMESTAMP}.sql.gz"
+                  echo "Starting backup: ${FILENAME}"
+                  pg_dump "$DATABASE_URL" | gzip > /backup/${FILENAME}
+                  echo "${FILENAME}" > /backup/LATEST
+                  ls -lh /backup/${FILENAME}
+                  echo "Backup complete"
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-secrets
+                      key: DATABASE_URL
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backup
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+          containers:
+            - name: upload
+              image: amazon/aws-cli:2.15.30
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  FILENAME=$(cat /backup/LATEST)
+                  echo "Uploading ${FILENAME} to s3://{{S3_BACKUP_BUCKET}}/daily/"
+                  aws s3 cp "/backup/${FILENAME}" \
+                    "s3://{{S3_BACKUP_BUCKET}}/daily/${FILENAME}" \
+                    --region {{AWS_REGION}}
+                  echo "Upload complete"
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-secrets
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-secrets
+                      key: AWS_SECRET_ACCESS_KEY
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backup
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+          volumes:
+            - name: backup-volume
+              emptyDir:
+                sizeLimit: 500Mi

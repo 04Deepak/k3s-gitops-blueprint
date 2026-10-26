@@ -1,0 +1,132 @@
+# kube-prometheus-stack Helm values — tuned for a single-node K3s cluster.
+# Loaded by templates/argocd/monitoring.yaml (second source, $values/monitoring/values.yaml).
+# Installs: Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics.
+
+# K3s runs etcd/scheduler/controller-manager/kube-proxy inside one process and does not
+# expose them on the ports the chart expects. Disable them or you get permanent TargetDown noise.
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeProxy: false
+
+prometheus:
+  prometheusSpec:
+    retention: {{PROMETHEUS_RETENTION}}
+    # Pick up ServiceMonitors / PodMonitors / PrometheusRules from any namespace,
+    # not only those labelled with this Helm release.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 1Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: {{PROMETHEUS_STORAGE}}
+
+alertmanager:
+  alertmanagerSpec:
+    # Mounted at /etc/alertmanager/secrets/monitoring-secrets/<KEY>
+    # (created by the InfisicalSecret in manifests/secrets.yaml)
+    secrets:
+      - monitoring-secrets
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: slack
+      group_by: [alertname, namespace]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        # Watchdog always fires (proves the pipeline works). Never page on it.
+        - receiver: "null"
+          matchers:
+            - alertname = "Watchdog"
+        - receiver: "null"
+          matchers:
+            - alertname = "InfoInhibitor"
+    receivers:
+      - name: "null"
+      - name: slack
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/monitoring-secrets/SLACK_WEBHOOK_URL
+            channel: "{{ALERT_SLACK_CHANNEL}}"
+            send_resolved: true
+
+grafana:
+  # Admin credentials come from the Infisical-synced Secret, never from values.
+  admin:
+    existingSecret: monitoring-secrets
+    userKey: GRAFANA_ADMIN_USER
+    passwordKey: GRAFANA_ADMIN_PASSWORD
+  # RWO volume: Recreate avoids two pods fighting for the volume during an update.
+  deploymentStrategy:
+    type: Recreate
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 2Gi
+  grafana.ini:
+    server:
+      root_url: https://{{GRAFANA_DOMAIN}}
+    users:
+      allow_sign_up: false
+    auth.anonymous:
+      enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+  # Exposed through a Traefik IngressRoute (manifests/grafana-ingress.yaml), not a chart Ingress.
+  ingress:
+    enabled: false
+
+prometheus-node-exporter:
+  resources:
+    limits:
+      memory: 64Mi
+
+kube-state-metrics:
+  resources:
+    limits:
+      memory: 128Mi

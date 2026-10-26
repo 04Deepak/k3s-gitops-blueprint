@@ -1,0 +1,19 @@
+# Scrapes Traefik's built-in Prometheus metrics (request counts, 5xx rates, certificate expiry).
+# VERIFY before relying on it: the metrics port name can differ between Traefik chart versions.
+#   kubectl -n kube-system get pod -l app.kubernetes.io/name=traefik -o yaml | grep -B2 -A3 containerPort
+# If the port is not named "metrics", change podMetricsEndpoints[0].port below.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: traefik
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames:
+      - kube-system
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: traefik
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics

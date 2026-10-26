@@ -292,29 +292,31 @@ echo | openssl s_client -connect app.example.com:443 -servername app.example.com
 
 Traefik renews Let's Encrypt certificates automatically 30 days before expiry. If renewal fails (DNS issues, rate limits), certificates expire and HTTPS breaks. The health-check script catches this at 30 days.
 
-## What's Planned
+## Metrics, Alerting and What's Planned
 
-### Prometheus + Grafana
+### Prometheus + Grafana (available)
 
-Metrics and alerting on silent failure modes:
-- Cron last-success timestamp per job (alert if no success in 2× schedule)
+Implemented as `kube-prometheus-stack` in `templates/monitoring/`; see [setup/12-monitoring.md](../setup/12-monitoring.md).
+
+Included alerts: crash loops, OOM kills, missing replicas, HPA at max, failed CronJobs, node disk and memory pressure, PVC filling, ingress 5xx rate and TLS certificate expiry. Alerts go to Slack through Alertmanager.
+
+Application-level metrics are not included because they depend on your code. Good candidates to add as your own ServiceMonitors and rules:
+- Cron last-success timestamp per job (alert if no success in 2x the schedule)
 - Notification queue depth and age
 - SSE active connection count
 - External integration error rate and latency
-- 5xx rate on API endpoints
 
 ### Loki Centralized Logging
 
 Durable centralized logging with ≥1 year retention:
-- Ship container logs to Loki via Promtail/FluentBit
+- Ship container logs to Loki via Grafana Alloy (Promtail is deprecated)
 - Store in S3 (same region as backups)
 - Query via Grafana
 
 Depends on: log redaction being in place first — without it, centralized logging durably persists secrets and PII that console-only logs would have rotated away.
 
-### Alerting
+### Alerting (next steps)
 
-Once Prometheus is in place:
-- Slack notifications for critical alerts (CronJob failure, pod crash, high error rate)
+Slack notifications for critical alerts are already configured in `monitoring/values.yaml`. Still planned:
 - PagerDuty for on-call escalation
 - ArgoCD notifications for deploy status (success/failure/health-degraded)

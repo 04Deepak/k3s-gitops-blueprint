@@ -1,0 +1,63 @@
+# Monitoring stack — two ArgoCD Applications:
+#   1. kube-prometheus-stack (Helm chart, values from this repo's monitoring/values.yaml)
+#   2. monitoring-extras (plain manifests: alert rules, Grafana ingress, secrets, Traefik PodMonitor)
+# Requires ArgoCD 2.6+ (multi-source Applications).
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-monitoring-stack
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://prometheus-community.github.io/helm-charts
+      chart: kube-prometheus-stack
+      targetRevision: 92.2.0
+      helm:
+        releaseName: monitoring
+        valueFiles:
+          - $values/monitoring/values.yaml
+    - repoURL: {{DEVOPS_REPO}}
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # The chart's CRDs are too large for client-side apply; without this the sync fails.
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-monitoring-extras
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: monitoring/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # PrometheusRule / PodMonitor CRDs come from the stack app; don't fail if they are not there yet.
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

@@ -11,8 +11,8 @@ All names, domains and IPs here are fictional examples (`acme`, `example.com`, `
 | Directory | Purpose | Count |
 |-----------|---------|-------|
 | `docs/` | Architecture documentation — how everything works and why | 12 docs |
-| `setup/` | Step-by-step guides — bare VPS to production cluster | 12 guides |
-| `templates/` | Working K8s manifests + CI/CD with `{{PLACEHOLDER}}` tokens | 36 files |
+| `setup/` | Step-by-step guides — bare VPS to production cluster | 13 guides |
+| `templates/` | Working K8s manifests + CI/CD with `{{PLACEHOLDER}}` tokens | 42 files |
 | `overlay/` | Prisma/Express/Vite-specific patterns and Dockerfiles | 6 files |
 
 ## Quick Start
@@ -20,7 +20,7 @@ All names, domains and IPs here are fictional examples (`acme`, `example.com`, `
 1. **Clone this repo**
 2. **Fill in your values** in `templates/vars.env`
 3. **Run `templates/init.sh`** — generates a ready-to-use `output/` directory (needs bash 4+; on macOS: `brew install bash`)
-4. **Follow `setup/` guides in order** (00 → 11) to stand up infrastructure
+4. **Follow `setup/` guides in order** (00 → 12) to stand up infrastructure
 5. **Push `output/`** as your project's devops repo — ArgoCD takes it from there
 
 ## Stack
@@ -36,6 +36,7 @@ All names, domains and IPs here are fictional examples (`acme`, `example.com`, `
 | CI/CD | GitHub Actions → GHCR | Build, test, push images, GitOps manifest update |
 | Backup | pg_dump → S3 | Object Lock, isolated IAM, Glacier archival |
 | Scaling | HPA + PDB | CPU-based autoscaling with disruption budgets |
+| Monitoring | Prometheus + Grafana + Alertmanager | Metrics, dashboards, Slack alerts (kube-prometheus-stack) |
 | Security | WireGuard + ClusterIP + scoped DB users | Defense in depth |
 
 ## Architecture at a Glance
@@ -100,7 +101,7 @@ See [`templates/vars.env`](templates/vars.env) for the full variable list with d
 | 08 | [Scaling](docs/08-scaling.md) | HPA, PDB, resource budgets |
 | 09 | [Security](docs/09-security.md) | TLS, WireGuard, rate limiting, hardening |
 | 10 | [CronJobs](docs/10-cronjobs.md) | CLI runner pattern, backup, scheduling |
-| 11 | [Monitoring](docs/11-monitoring.md) | Health checks, kubectl commands, observability |
+| 11 | [Monitoring](docs/11-monitoring.md) | Health checks, metrics, alerting, what is planned |
 | 12 | [Alternatives](docs/12-alternatives.md) | Technology choices and when to pick differently |
 
 ## Setup Guides Index
@@ -119,6 +120,7 @@ See [`templates/vars.env`](templates/vars.env) for the full variable list with d
 | 09 | [Backup](setup/09-backup.md) | Automated S3 backups running |
 | 10 | [Scaling](setup/10-scaling.md) | HPA + PDB configured |
 | 11 | [Security Hardening](setup/11-security-hardening.md) | VPN, firewall, access control |
+| 12 | [Monitoring](setup/12-monitoring.md) | Prometheus, Grafana, Slack alerts |
 
 ## Overlay
 

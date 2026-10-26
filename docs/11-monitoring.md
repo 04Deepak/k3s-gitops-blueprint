@@ -306,14 +306,11 @@ Application-level metrics are not included because they depend on your code. Goo
 - SSE active connection count
 - External integration error rate and latency
 
-### Loki Centralized Logging
+### Loki Centralized Logging (optional, experimental)
 
-Durable centralized logging with ≥1 year retention:
-- Ship container logs to Loki via Grafana Alloy (Promtail is deprecated)
-- Store in S3 (same region as backups)
-- Query via Grafana
+Available as an optional low-resource profile: Loki (single binary, filesystem storage) plus Grafana Alloy as the shipper (Promtail is deprecated). See [setup/13-logging.md](../setup/13-logging.md). Values are checked against the chart defaults but not yet measured on a live cluster.
 
-Depends on: log redaction being in place first — without it, centralized logging durably persists secrets and PII that console-only logs would have rotated away.
+Still planned for a larger setup: object storage (S3) and longer retention. Depends on log redaction being in place first. Without it, centralized logging durably persists secrets and PII that console-only logs would have rotated away.
 
 ### Alerting (next steps)
 

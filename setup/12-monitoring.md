@@ -17,7 +17,7 @@ This guide adds metrics, dashboards and alerts to the cluster using `kube-promet
 | `monitoring/manifests/alert-rules.yaml` | Crash loops, OOM kills, missing replicas, HPA maxed out, failed jobs, disk/memory/PVC pressure, 5xx rate, TLS expiry |
 | `monitoring/manifests/traefik-podmonitor.yaml` | Feeds Traefik request and certificate metrics to Prometheus |
 
-Footprint: plan for roughly 1 GB of RAM on the node. Check with `kubectl top pods -n monitoring` after a day and adjust `monitoring/values.yaml`.
+Footprint: **not measured.** Prometheus, Grafana and Alertmanager need real memory, and the maintainer had to remove the full stack (with Loki) from a small server for lack of CPU and RAM. On a small node, add the lite override: put `$values/monitoring/values-lite.yaml` after `values.yaml` in `templates/argocd/monitoring.yaml` (60s scrape, 3-day retention, smaller limits; the numbers are estimates). Check real usage with `kubectl top pods -n monitoring` after a day. Logs are a separate optional guide: [13-logging.md](13-logging.md).
 
 ---
 

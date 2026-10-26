@@ -1,0 +1,91 @@
+# Loki Helm values (grafana/loki chart) — LOW-RESOURCE single-binary profile for one small node.
+# EXPERIMENTAL: keys were checked against the chart's default values, but this has not been
+# measured on a live cluster. The chart's own single-binary example asks for 2 CPU / 2 GiB RAM
+# and runs MinIO; this profile deliberately uses far less and stores data on the local PVC.
+# Resource numbers below are starting estimates, not measurements. Tune them with `kubectl top`.
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  storage:
+    type: filesystem
+  limits_config:
+    # Logs older than this are deleted by the compactor. Keep it short on a small disk.
+    retention_period: {{LOKI_RETENTION}}
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+  ingester:
+    chunk_encoding: snappy
+  querier:
+    max_concurrent: 2
+
+singleBinary:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  extraEnv:
+    # Keep the Go heap a little below the memory limit so Loki is not OOMKilled.
+    - name: GOMEMLIMIT
+      value: 450MiB
+  persistence:
+    enabled: true
+    storageClass: local-path
+    size: {{LOKI_STORAGE}}
+
+# Components a single small node does not need. Each one costs RAM.
+gateway:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+minio:
+  enabled: false
+
+# Zero out the other deployment modes.
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0
+ingester:
+  replicas: 0
+querier:
+  replicas: 0
+queryFrontend:
+  replicas: 0
+queryScheduler:
+  replicas: 0
+distributor:
+  replicas: 0
+compactor:
+  replicas: 0
+indexGateway:
+  replicas: 0
+bloomGateway:
+  replicas: 0
+bloomPlanner:
+  replicas: 0
+bloomBuilder:
+  replicas: 0

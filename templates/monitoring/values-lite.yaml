@@ -1,0 +1,40 @@
+# OPTIONAL "lite" override for kube-prometheus-stack on small servers.
+# Add it AFTER values.yaml in templates/argocd/monitoring.yaml:
+#   valueFiles:
+#     - $values/monitoring/values.yaml
+#     - $values/monitoring/values-lite.yaml
+# Later files win. The numbers are starting estimates, not measurements.
+# What it saves: fewer samples (60s scrape), shorter history, smaller limits, no Alertmanager disk.
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 60s
+    evaluationInterval: 60s
+    retention: 3d
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        memory: 512Mi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+
+grafana:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
+
+# Alertmanager is small but needs a volume; the alerts themselves are what matters.
+# Silences are lost on restart without a volume, which is acceptable on a small server.
+alertmanager:
+  alertmanagerSpec:
+    storage: null

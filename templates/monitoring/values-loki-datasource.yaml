@@ -1,0 +1,8 @@
+# Adds Loki as a Grafana data source. Add this file to the stack's valueFiles
+# ONLY when you install logging (setup/13-logging.md).
+grafana:
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      access: proxy
+      url: http://loki.monitoring.svc.cluster.local:3100

@@ -1,5 +1,9 @@
 # Production ArgoCD Applications — backend + frontend
 # ArgoCD watches the devops repo and auto-syncs changes.
+#
+# If an Application here will ever manage a StatefulSet, give it the ignoreDifferences block at
+# the bottom of this file. Without it the Application sits OutOfSync forever and syncing never
+# clears it — see the comment there for why.
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -42,3 +46,46 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+---
+# Shared services (PostgreSQL, Redis). Separate from the app Applications because these outlive
+# any single app and should not be pruned when an app is removed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{PROJECT_NAME}}-shared
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{DEVOPS_REPO}}
+    targetRevision: main
+    path: shared
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shared
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+  # REQUIRED for any Application managing a StatefulSet. Verified live: without it the postgres
+  # StatefulSet reports OutOfSync permanently and an explicit sync does not clear it.
+  #
+  # The API server defaults fields into volumeClaimTemplates that cannot be written in git:
+  #     spec.volumeMode: Filesystem     (defaulted on admission)
+  #     status: {phase: Pending}        (a status subresource, nested inside the template)
+  # ArgoCD diffs those against your manifest, decides it is out of sync, and tries to reconcile.
+  # It cannot: volumeClaimTemplates is immutable on an existing StatefulSet. The Application then
+  # stays OutOfSync forever, which is worse than cosmetic — it masks genuine drift in every other
+  # resource the Application manages, so you stop trusting the status column.
+  #
+  # Ignoring the whole block costs nothing, because it cannot be changed through GitOps anyway.
+  # Growing a StatefulSet's volume means deleting the StatefulSet with --cascade=orphan, editing
+  # the PVC, then re-creating the StatefulSet.
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates

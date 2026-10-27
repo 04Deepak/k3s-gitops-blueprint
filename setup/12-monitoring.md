@@ -17,7 +17,64 @@ This guide adds metrics, dashboards and alerts to the cluster using `kube-promet
 | `monitoring/manifests/alert-rules.yaml` | Crash loops, OOM kills, missing replicas, HPA maxed out, failed jobs, disk/memory/PVC pressure, 5xx rate, TLS expiry |
 | `monitoring/manifests/traefik-podmonitor.yaml` | Feeds Traefik request and certificate metrics to Prometheus |
 
-Footprint: **not measured.** Prometheus, Grafana and Alertmanager need real memory, and the maintainer had to remove the full stack (with Loki) from a small server for lack of CPU and RAM. On a small node, add the lite override: put `$values/monitoring/values-lite.yaml` after `values.yaml` in `templates/argocd/monitoring.yaml` (60s scrape, 3-day retention, smaller limits; the numbers are estimates). Check real usage with `kubectl top pods -n monitoring` after a day. Logs are a separate optional guide: [13-logging.md](13-logging.md).
+### Footprint — measured
+
+Measured on a 4-vCPU / 15Gi node running K3s v1.36.5, with ArgoCD, Infisical, PostgreSQL, Redis
+and two app Deployments already present. `kube-prometheus-stack` 92.2.0, **lite profile**, 13
+scrape targets, 108,835 head series:
+
+| Pod | CPU (actual) | Memory (actual) | Memory limit |
+|---|---|---|---|
+| Grafana | 9m idle | **391Mi** | 640Mi |
+| Prometheus | 8–19m | **348Mi** | 768Mi |
+| Alertmanager | 1m | 24Mi | 128Mi |
+| kube-state-metrics | 1–5m | 20Mi | 128Mi |
+| prometheus-operator | 2m | 22Mi | 192Mi |
+| node-exporter | 1–2m | 9Mi | 64Mi |
+
+Cluster totals before and after installing the stack:
+
+| | CPU requests | Memory requests | Memory limits |
+|---|---|---|---|
+| Before | 1425m (36%) | 2956Mi (19%) | 7978Mi (52%) |
+| After | 1600m (40%) | 3916Mi (25%) | 9898Mi (64%) |
+
+**So the stack costs roughly +175m CPU and +960Mi of memory requests.** Actual steady-state usage
+is about 40m CPU and 815Mi of memory. It fits comfortably on a 15Gi node; it would not fit on a
+2Gi one.
+
+> **Do not lower the Grafana memory limit.** Grafana 12.x runs an embedded apiserver that
+> registers ~20 GroupVersions at boot, and its startup peak is fixed regardless of how little it
+> serves afterwards. At a 192Mi limit it OOMKills mid-boot (exit 137) in a permanent
+> CrashLoopBackOff — on a node with 89% of its memory free. The logs are no help: they show a page
+> of healthy `Installed APIs for app` lines and then stop. The only place the cause appears is:
+>
+> ```bash
+> kubectl -n monitoring get pod -l app.kubernetes.io/name=grafana \
+>   -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="grafana")].lastState.terminated.reason}'
+> ```
+
+> **Prometheus memory scales with series, not with scrape interval or retention.** 108k head
+> series from 13 targets is normal — most of it is cadvisor and kube-state-metrics, and it grows
+> with every container you run. Lowering `scrapeInterval` reduces samples per series and
+> `retention` reduces disk; neither meaningfully reduces head memory. To actually shrink
+> Prometheus you must drop series, which is what the commented `cAdvisorMetricRelabelings` block
+> at the bottom of `values-lite.yaml` does. Check your own number before tuning anything:
+>
+> ```bash
+> IP=$(kubectl -n monitoring get pod prometheus-monitoring-kube-prometheus-prometheus-0 \
+>        -o jsonpath='{.status.podIP}')
+> curl -s "http://$IP:9090/api/v1/status/tsdb" | python3 -m json.tool | head -20
+> ```
+>
+> An OOMKilled Prometheus loses its whole head block — up to 2 hours of unwritten samples — on
+> every restart, so a limit that is merely "probably enough" costs you data silently.
+
+On a small node, add the lite override: put `$values/monitoring/values-lite.yaml` after
+`values.yaml` in `templates/argocd/monitoring.yaml`. Re-check real usage with
+`kubectl top pods -n monitoring` after a day — series count climbs as you add workloads.
+
+Logs are a separate optional guide: [13-logging.md](13-logging.md).
 
 ---
 

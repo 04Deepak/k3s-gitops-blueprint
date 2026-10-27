@@ -51,8 +51,14 @@ spec:
             - containerPort: 5432
               name: pgbouncer
           env:
+            # The DSN lives in the pgbouncer-auth Secret, produced by pgbouncer-secret.yaml from
+            # Infisical. It is deliberately NOT a literal here: this manifest is committed to
+            # git and synced by ArgoCD, so anything inline is a credential in git history.
             - name: DATABASE_URL
-              value: "postgresql://{{DB_USER}}:{{DB_PASSWORD}}@{{POSTGRES_CLUSTERIP}}:5432/{{DB_NAME}}"
+              valueFrom:
+                secretKeyRef:
+                  name: pgbouncer-auth
+                  key: DATABASE_URL
           resources:
             requests:
               cpu: 50m

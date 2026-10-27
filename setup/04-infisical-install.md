@@ -10,140 +10,151 @@ Install self-hosted Infisical for centralized secrets. The secrets-operator sync
 
 ## Part A: Install Infisical
 
-### Step 1: Create database for Infisical
-
-Infisical needs its own PostgreSQL database:
+### Pick the right chart — there are two, and they are not interchangeable
 
 ```bash
-kubectl -n shared exec -it postgres-0 -- psql -U {{DB_USER}} -d postgres <<'SQL'
-CREATE DATABASE infisical;
-SQL
+helm repo add infisical https://dl.cloudsmith.io/public/infisical/helm-charts/helm/charts/
+helm repo update
+helm search repo infisical
 ```
 
-### Step 2: Create namespace
+| Chart | Version | Backend | Use it? |
+|-------|---------|---------|---------|
+| `infisical/infisical` | 0.4.2 (app 1.17.0) | **MongoDB** | **No.** Legacy. |
+| `infisical/infisical-standalone` | 1.11.1 (app v0.167.0) | **PostgreSQL** | **Yes.** |
+
+This matters more than a version bump. The legacy chart takes its configuration from a top-level
+`backendEnvironmentVariables` map and has **no** `backend.env` and **no** `backend.resources` keys
+at all. Point a modern values file at it and Helm accepts every key without complaint while the
+chart ignores all of them — you end up with an Infisical that has an empty `ENCRYPTION_KEY` and no
+database connection, and nothing tells you why.
+
+Check before you trust any key, in any chart:
+
+```bash
+helm show values infisical/infisical-standalone --version 1.11.1 | grep -nE "^infisical:|kubeSecretRef|^postgresql:|^redis:"
+```
+
+### Step 1: The database already exists
+
+`templates/shared/postgres.yaml` created it on first boot, because `vars.env` sets
+`DB_NAME={{DB_NAME}}`. Confirm rather than create:
+
+```bash
+kubectl -n shared exec postgres-0 -- \
+  psql -U {{DB_SUPERUSER}} -d {{DB_NAME}} -tAc "SELECT datname FROM pg_database WHERE datname='{{DB_NAME}}';"
+```
+
+Also confirm the application role can **create tables**, or every migration will fail:
+
+```bash
+kubectl -n shared exec postgres-0 -- \
+  psql -U {{DB_SUPERUSER}} -d {{DB_NAME}} -tAc \
+  "SELECT has_schema_privilege('{{DB_USER}}','public','CREATE');"
+```
+
+Expected: `t`. If it says `f`, you are on PostgreSQL 15 or newer, where the `public` schema no
+longer grants `CREATE` to everyone. Fix it:
+
+```bash
+kubectl -n shared exec postgres-0 -- \
+  psql -U {{DB_SUPERUSER}} -d {{DB_NAME}} -c "GRANT USAGE, CREATE ON SCHEMA public TO {{DB_USER}};"
+```
+
+### Step 2: Namespace
 
 ```bash
 kubectl create namespace infisical
 ```
 
-### Step 3: Add Helm repo
+### Step 3: Create the config Secret
+
+This chart reads **all** its configuration from a Kubernetes Secret named by
+`infisical.kubeSecretRef`. Every key in that Secret becomes an environment variable on the pod.
+Nothing goes into the values file, so nothing sensitive ends up in git.
 
 ```bash
-helm repo add infisical https://dl.cloudsmith.io/public/infisical/helm-charts/helm/charts/
-helm repo update
+REDIS_PW=$(kubectl -n shared get secret redis-auth -o jsonpath='{.data.REDIS_PASSWORD}' | base64 -d)
+DB_PW='<the {{DB_USER}} password from your password manager>'
+
+kubectl -n infisical create secret generic infisical-secrets \
+  --from-literal=ENCRYPTION_KEY="$(openssl rand -hex 16)" \
+  --from-literal=AUTH_SECRET="$(openssl rand -base64 32)" \
+  --from-literal=DB_CONNECTION_URI="postgresql://{{DB_USER}}:${DB_PW}@postgres.shared.svc.cluster.local:5432/{{DB_NAME}}" \
+  --from-literal=REDIS_URL="redis://:${REDIS_PW}@redis.shared.svc.cluster.local:6379" \
+  --from-literal=SITE_URL="https://{{INFISICAL_DOMAIN}}"
+unset DB_PW REDIS_PW
 ```
 
-### Step 4: Prepare values
+Three things worth noticing:
 
-Generate secrets for Infisical itself:
+- `ENCRYPTION_KEY` must be exactly **32 hex characters** (`openssl rand -hex 16`). **Back it up
+  now.** Every secret Infisical stores is encrypted with it; lose it and the data is gone, and
+  re-installing with a new key leaves you with a database full of unreadable rows.
+- `REDIS_URL` carries a password. The Redis from guide 02 requires one, and the empty-username
+  form `redis://:password@host` is correct.
+- Nothing here is echoed to the terminal, so none of it reaches your shell history.
+
+Confirm the keys without printing the values:
 
 ```bash
-# Encryption key (32 hex chars)
-ENCRYPTION_KEY=$(openssl rand -hex 16)
-echo "ENCRYPTION_KEY=$ENCRYPTION_KEY"
-
-# Auth secret (for JWT signing)
-AUTH_SECRET=$(openssl rand -base64 32)
-echo "AUTH_SECRET=$AUTH_SECRET"
+kubectl -n infisical get secret infisical-secrets -o go-template='{{range $k,$v := .data}}{{$k}}{{"\n"}}{{end}}'
 ```
 
-> **Save these values somewhere safe** (password manager, not git). You'll need them if you ever redeploy Infisical.
-
-Create a values file:
+### Step 4: Install
 
 ```bash
-cat > /tmp/infisical-values.yaml <<EOF
-backend:
-  replicaCount: 1
-  resources:
-    limits:
-      memory: 1Gi
-      cpu: 1000m
-    requests:
-      memory: 256Mi
-      cpu: 100m
-  env:
-    - name: ENCRYPTION_KEY
-      value: "$ENCRYPTION_KEY"
-    - name: AUTH_SECRET
-      value: "$AUTH_SECRET"
-    - name: DB_CONNECTION_URI
-      value: "postgresql://{{DB_USER}}:{{DB_PASSWORD}}@postgres.shared.svc.cluster.local:5432/infisical"
-    - name: REDIS_URL
-      value: "redis://redis.shared.svc.cluster.local:6379"
-    - name: SITE_URL
-      value: "https://{{INFISICAL_DOMAIN}}"
-    - name: SMTP_HOST
-      value: ""
-    - name: SMTP_PORT
-      value: "587"
-    - name: SMTP_FROM_ADDRESS
-      value: ""
-    - name: SMTP_FROM_NAME
-      value: "Infisical"
-
-frontend:
-  enabled: false
-
-redis:
-  enabled: false
-
-mongodb:
-  enabled: false
-EOF
-```
-
-> We disable frontend (Infisical backend serves the UI), Redis (use shared), and MongoDB (legacy).
-
-### Step 5: Install
-
-```bash
-helm install infisical infisical/infisical \
+helm install infisical infisical/infisical-standalone \
   --namespace infisical \
-  -f /tmp/infisical-values.yaml \
-  --wait --timeout 5m
+  --version 1.11.1 \
+  -f output/infisical/values.yaml \
+  --wait --timeout 10m
 ```
+
+`templates/infisical/values.yaml` turns off four things. Each one is there for a reason:
+
+| Setting | Why |
+|---------|-----|
+| `postgresql.enabled: false` | Defaults to **true** — leave it out and you get a second PostgreSQL next to the shared one. |
+| `redis.enabled: false` | Same: defaults to **true**. |
+| `ingress.enabled: false` | Traefik handles ingress, via `templates/admin-ingress/infisical-ingress.yaml`. |
+| `ingress.nginx.enabled: false` | **Read this one twice.** The bundled ingress-nginx subchart is gated on `ingress.nginx.enabled`, *not* on `ingress.enabled`. Set only the latter and you get a complete nginx ingress controller whose LoadBalancer sits at `<pending>` and whose `svclb` pod is stuck `Pending 0/2` forever, because Traefik already holds host ports 80 and 443. |
 
 **Verify:**
 
 ```bash
 kubectl -n infisical get pods
+kubectl get svc -A --field-selector spec.type=LoadBalancer
+kubectl get pods -A --field-selector status.phase=Pending
 ```
 
-Expected: `infisical-backend-xxx` Running, `1/1`.
+Expected: exactly one Infisical pod `1/1 Running`; `traefik` the only LoadBalancer; no Pending
+pods anywhere.
 
-### Step 6: Access the UI
-
-Port-forward to access it:
+Confirm the migrations ran against the shared PostgreSQL:
 
 ```bash
-kubectl -n infisical port-forward svc/infisical-backend 8080:8080
-# Open http://localhost:8080
+kubectl -n shared exec postgres-0 -- \
+  psql -U {{DB_SUPERUSER}} -d {{DB_NAME}} -tAc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
 ```
 
-- Click "Create an account" → register your admin user
-- This first user becomes the superadmin
+Expected: several hundred tables. `0` means the app role cannot create tables — go back to step 1.
 
-### Step 7: Create your project
+> **If an install gets interrupted**, the release is left in `pending-install` and every later
+> command fails with `another operation (install/upgrade/rollback) is in progress`. Clear it with
+> `helm uninstall infisical -n infisical` (your `infisical-secrets` Secret was created with
+> `kubectl`, so it survives, and so does the data), or `helm rollback` if there is an earlier
+> revision.
 
-In the Infisical UI:
-1. Click "Add New Project" → name it `{{PROJECT_NAME}}`
-2. Note the **project ID** (shown in the URL or project settings)
-3. Go to the project → Secrets → add your application secrets:
+### Step 5: Create the first account
 
-| Key | Example value | Notes |
-|-----|---------------|-------|
-| `DATABASE_URL` | `postgresql://user:pass@pgbouncer:6432/db` | Via PgBouncer |
-| `DIRECT_URL` | `postgresql://user:pass@postgres.shared:5432/db` | Direct, for migrations |
-| `REDIS_URL` | `redis://redis.shared:6379` | Shared Redis |
-| `JWT_SECRET` | (generate: `openssl rand -base64 48`) | Long random string |
-| `JWT_EXPIRY` | `7d` | Token lifetime |
-| `NODE_ENV` | `production` | |
-| `PORT` | `5000` | Backend port |
+```bash
+kubectl -n infisical port-forward svc/infisical-infisical-standalone-infisical 8080:8080
+```
 
-Add more as your app needs them. Infisical supports **environments** — create `prod` and `staging` with different values.
-
----
+Open `http://localhost:8080` and register. **The first user becomes the superadmin**, so do this
+immediately after install, before the UI is reachable from the internet.
 
 ## Part B: Install Secrets Operator
 

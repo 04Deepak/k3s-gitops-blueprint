@@ -19,19 +19,45 @@ helm repo add argo https://argoproj.github.io/argo-helm
 helm repo update
 ```
 
-Install with `server.insecure: true` — Traefik terminates TLS, so ArgoCD doesn't need its own cert:
+Install from `templates/argocd/values.yaml`, pinning the chart version:
 
 ```bash
 helm install argocd argo/argo-cd \
   --namespace argocd \
-  --set server.insecure=true \
-  --set configs.params."server\.insecure"=true \
-  --set applicationSet.enabled=false \
-  --set notifications.enabled=false \
-  --wait
+  --version 10.11.6 \
+  -f output/argocd/values.yaml \
+  --wait --timeout 10m
 ```
 
-> We disable ApplicationSet and Notifications controllers — they're not needed for a basic setup and eliminating them reduces pod count and log noise.
+> **Pin the version.** An unpinned `helm install argo/argo-cd` takes whatever is newest that day, so two people following this guide a month apart get different clusters. It also makes a failure reproducible — this install failed on the first attempt with `context deadline exceeded` fetching the `.tgz` from `release-assets.githubusercontent.com`. If that happens, download once and install from the file:
+>
+> ```bash
+> helm pull argo/argo-cd --version 10.11.6 --destination ./charts
+> helm install argocd ./charts/argo-cd-10.11.6.tgz -n argocd -f output/argocd/values.yaml --wait
+> ```
+
+### Why a values file and not `--set`
+
+Earlier versions of this guide used `--set` flags. **Two of them did nothing at all**, and Helm accepted both silently — unknown `--set` keys are not an error, and they even show up in `helm get values` as if they had worked:
+
+| Flag that looks right | What actually happens |
+|---|---|
+| `--set server.insecure=true` | There is no `insecure` key under `server:` in this chart. The real one is `configs.params."server.insecure"`. |
+| `--set applicationSet.enabled=false` | There is no `enabled` key under `applicationSet:` either. The controller keeps running. Use `applicationSet.replicas: 0`. |
+
+Confirm for yourself before trusting any value:
+
+```bash
+helm show values argo/argo-cd --version 10.11.6 | grep -nE "^applicationSet:|^  insecure:"
+```
+
+The values file also sets CPU and memory on all four components. The chart ships `resources: {}` for every one of them, which puts all six ArgoCD pods in the **BestEffort** QoS class — the first thing the kubelet evicts under node pressure, which is exactly when you need ArgoCD working. Check:
+
+```bash
+kubectl -n argocd get pods -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass'
+```
+
+Every pod should say `Burstable`. If any says `BestEffort`, your values file was not applied.
 
 **Verify:**
 
@@ -39,16 +65,18 @@ helm install argocd argo/argo-cd \
 kubectl -n argocd get pods
 ```
 
-Expected (3 main pods Running):
+Expected — four running pods, plus a completed one-shot Job:
 
 ```
-NAME                                  READY   STATUS
-argocd-application-controller-0       1/1     Running
-argocd-repo-server-xxx                1/1     Running
-argocd-server-xxx                     1/1     Running
-argocd-redis-xxx                      1/1     Running
-argocd-dex-server-xxx                 1/1     Running
+NAME                                  READY   STATUS      RESTARTS
+argocd-application-controller-0       1/1     Running     0
+argocd-redis-xxx                      1/1     Running     0
+argocd-redis-secret-init-xxx          0/1     Completed   0
+argocd-repo-server-xxx                1/1     Running     0
+argocd-server-xxx                     1/1     Running     0
 ```
+
+No `argocd-dex-server` (no SSO configured) and no `argocd-applicationset-controller` pod (scaled to zero). The `argocd-redis-secret-init` Job is normal and stays `Completed`.
 
 ## Step 3: Get the initial admin password
 
@@ -80,52 +108,48 @@ kubectl -n argocd delete secret argocd-initial-admin-secret
 
 ## Step 5: Add your devops repo
 
-ArgoCD needs read access to your devops Git repo.
+ArgoCD needs read access to the repo holding your manifests. Do this **declaratively**, with a
+Secret — not with the `argocd` CLI. A CLI login lives inside one `kubectl exec` session and is
+gone the moment that session ends, which is why the CLI-based verification in older versions of
+this guide never worked.
 
-**Option A: SSH key (recommended)**
-
-Generate a deploy key:
-
-```bash
-ssh-keygen -t ed25519 -C "argocd-deploy-key" -f /tmp/argocd-deploy-key -N ""
-```
-
-Add the public key (`/tmp/argocd-deploy-key.pub`) as a Deploy Key on your devops repo:
-- GitHub → repo → Settings → Deploy Keys → Add deploy key
-- Title: `argocd`
-- Key: contents of `/tmp/argocd-deploy-key.pub`
-- Allow write access: No (read-only is fine)
-
-Add the repo to ArgoCD:
+Generate a deploy key **on the server**, so the private half never travels:
 
 ```bash
-kubectl -n argocd exec -it deploy/argocd-server -- bash
-
-argocd login localhost:8080 --plaintext --username admin --password 'YOUR_PASSWORD'
-argocd repo add {{DEVOPS_REPO}} \
-  --ssh-private-key-path /dev/stdin <<< 'PASTE_PRIVATE_KEY_HERE'
-exit
+ssh-keygen -t ed25519 -C "argocd-deploy-key" -f /root/argocd-deploy-key -N ""
+cat /root/argocd-deploy-key.pub
 ```
 
-**Option B: HTTPS with PAT**
+Add the **public** key on GitHub: repo → Settings → Deploy keys → Add deploy key.
+Title `argocd`, paste the key, and leave **"Allow write access" unticked**. ArgoCD only reads.
+
+Now create the credential Secret. ArgoCD discovers it by label, not by name:
 
 ```bash
-kubectl -n argocd exec -it deploy/argocd-server -- bash
-
-argocd login localhost:8080 --plaintext --username admin --password 'YOUR_PASSWORD'
-argocd repo add https://github.com/{{GHCR_ORG}}/{{PROJECT_NAME}}-devops.git \
-  --username git --password 'YOUR_GITHUB_PAT'
-exit
+kubectl -n argocd create secret generic devops-repo \
+  --from-literal=type=git \
+  --from-literal=url={{DEVOPS_REPO}} \
+  --from-file=sshPrivateKey=/root/argocd-deploy-key \
+  --dry-run=client -o yaml \
+  | kubectl label -f - --local -o yaml --dry-run=client \
+      argocd.argoproj.io/secret-type=repository \
+  | kubectl apply -f -
 ```
 
-**Verify the repo is connected:**
+**Verify the label is there** — without it ArgoCD ignores the Secret completely and you get a
+confusing "repository not accessible" later:
 
 ```bash
-kubectl -n argocd exec deploy/argocd-server -- \
-  argocd repo list --plaintext
+kubectl -n argocd get secret devops-repo --show-labels
 ```
 
-Expected: your repo URL with `STATUS: Successful`.
+Expected to include `argocd.argoproj.io/secret-type=repository`.
+
+Confirm ArgoCD actually cloned it (do this after step 6, once an Application exists):
+
+```bash
+kubectl -n argocd logs deploy/argocd-repo-server --tail=200 | grep -i "Initializing git@"
+```
 
 ## Step 6: Apply ArgoCD Application manifests
 
@@ -137,20 +161,47 @@ kubectl apply -f templates/argocd/application.yaml
 
 This creates ArgoCD Applications for your backend and frontend.
 
-**Verify:**
+**Verify** — read the Application CRDs directly:
 
 ```bash
-kubectl -n argocd exec deploy/argocd-server -- \
-  argocd app list --plaintext
+kubectl -n argocd get applications -o custom-columns=\
+'NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status'
 ```
 
 Expected:
 
 ```
-NAME                     CLUSTER                         NAMESPACE   STATUS   HEALTH
-{{PROJECT_NAME}}-backend  https://kubernetes.default.svc  {{NS}}     Synced   Healthy
-{{PROJECT_NAME}}-frontend https://kubernetes.default.svc  {{NS}}     Synced   Healthy
+NAME                      SYNC     HEALTH
+{{PROJECT_NAME}}-backend   Synced   Healthy
+{{PROJECT_NAME}}-frontend  Synced   Healthy
 ```
+
+> **Do not use `argocd app list --plaintext` here.** It fails with
+> `{"level":"fatal","msg":"Argo CD server address unspecified"}`. `--plaintext` selects the
+> protocol; it does not supply a server address, and a login from an earlier interactive `exec`
+> does not carry into a new one. `argocd app list --core` fails too, with
+> `services is forbidden: User "system:serviceaccount:argocd:argocd-server" cannot list resource
+> "services"`. The Applications are Kubernetes resources — just read them with `kubectl`.
+
+### If an Application stays OutOfSync forever
+
+A StatefulSet will do this, and syncing will not help. The API server defaults fields into
+`volumeClaimTemplates` that cannot exist in your manifest (`spec.volumeMode`, and a
+`status: {phase: Pending}` block inside the template). ArgoCD sees drift and tries to reconcile,
+but `volumeClaimTemplates` is immutable, so it never succeeds.
+
+This matters more than it looks: a permanently OutOfSync Application hides **real** drift in
+everything else it manages. Add to that Application:
+
+```yaml
+  ignoreDifferences:
+    - group: apps
+      kind: StatefulSet
+      jsonPointers:
+        - /spec/volumeClaimTemplates
+```
+
+You lose nothing — that field cannot be changed through GitOps anyway.
 
 ## Step 7: Understand sync behavior
 
@@ -216,8 +267,7 @@ ssh -L 8080:localhost:8080 myserver \
 ### Application stuck in "Unknown" or "Missing"
 
 ```bash
-kubectl -n argocd exec deploy/argocd-server -- \
-  argocd app get {{PROJECT_NAME}}-backend --plaintext
+kubectl -n argocd get app {{PROJECT_NAME}}-backend -o yaml | sed -n '/^status:/,$p' | head -40
 ```
 
 Common causes:
@@ -233,16 +283,17 @@ The deploy key doesn't have access. Verify on GitHub:
 ### Application shows "OutOfSync" but won't sync
 
 ```bash
-kubectl -n argocd exec deploy/argocd-server -- \
-  argocd app diff {{PROJECT_NAME}}-backend --plaintext
+kubectl -n argocd get app {{PROJECT_NAME}}-backend -o json \
+  | jq -r '.status.resources[] | select(.status != "Synced") | "\(.kind)/\(.name): \(.status)"'
 ```
 
-This shows exactly what's different between git and the cluster.
+That lists exactly which resources differ from git. For a field-level diff, use the ArgoCD web UI
+(App → the resource → Diff) — the CLI needs a logged-in session, which `kubectl exec` cannot give it.
 
 ### Hook Job fails
 
 ```bash
-kubectl -n {{NAMESPACE}} logs job/backend-migrate
+kubectl -n {{NAMESPACE}} logs job/backend-migrate --tail=50
 ```
 
 Common causes:

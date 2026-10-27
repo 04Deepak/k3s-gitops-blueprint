@@ -181,13 +181,60 @@ If nothing arrives: check `http://localhost:9093` (port-forward `svc/monitoring-
 
 ## Step 6: Check the Traefik metrics
 
-The ingress alerts (`IngressHigh5xxRate`, `TLSCertificateExpiringSoon`) only work if Prometheus scrapes Traefik.
+The ingress alerts (`IngressHigh5xxRate`, `TLSCertificateExpiringSoon`) only work if Prometheus
+scrapes Traefik.
+
+> **If you installed the chart with `helm` by hand instead of through ArgoCD, stop here — this
+> step will fail and nothing will explain why.** The PodMonitor lives in
+> `monitoring/manifests/`, which is applied by **ArgoCD** from your devops repo (Steps 2–3), not
+> by the Helm release. A hand-installed chart has zero Traefik targets simply because the
+> PodMonitor object does not exist. Either finish Steps 2–3, or apply it directly:
+> `kubectl apply -f output/monitoring/manifests/traefik-podmonitor.yaml`
+
+Confirm the port name the PodMonitor expects actually exists on the pod:
 
 ```bash
-kubectl -n kube-system get pod -l app.kubernetes.io/name=traefik -o yaml | grep -B2 -A3 containerPort
+kubectl -n kube-system get pod -l app.kubernetes.io/name=traefik \
+  -o jsonpath='{range .items[0].spec.containers[*].ports[*]}{.name}={.containerPort}{"\n"}{end}'
 ```
 
-If the metrics port is not named `metrics`, edit `monitoring/manifests/traefik-podmonitor.yaml`. Then in Prometheus query `traefik_service_requests_total`; it should return series.
+Verified on chart `traefik-40.1.5+up40.1.0` (Traefik 3.7.13), where this prints:
+
+```
+metrics=9100
+traefik=8080
+web=8000
+websecure=8443
+```
+
+`metrics` is what the shipped PodMonitor asks for, so no edit is needed on that version. The name
+does change across Traefik chart majors — if yours differs, edit
+`monitoring/manifests/traefik-podmonitor.yaml`.
+
+Then confirm the target is actually **up**, which is the part that catches a wrong port name,
+a label-selector mismatch, or a NetworkPolicy in the way:
+
+```bash
+IP=$(kubectl -n monitoring get pod prometheus-monitoring-kube-prometheus-prometheus-0 \
+       -o jsonpath='{.status.podIP}')
+curl -s "http://$IP:9090/api/v1/targets?state=active" \
+  | python3 -c 'import json,sys; [print(t["labels"]["job"], t["health"], t.get("lastError") or "") for t in json.load(sys.stdin)["data"]["activeTargets"] if "traefik" in str(t["discoveredLabels"]).lower()]'
+```
+
+Expected: `monitoring/traefik up`. Allow up to a minute — the operator has to regenerate scrape
+config and Prometheus has to reload it, so a freshly applied PodMonitor reports `unknown` first.
+
+Finally query a real metric:
+
+```bash
+curl -s --get "http://$IP:9090/api/v1/query" \
+  --data-urlencode 'query=count(traefik_entrypoint_requests_total)'
+```
+
+> Note the metric name. Older versions of this guide said to query `traefik_service_requests_total`,
+> which only has series once a request has actually been routed to a backend **service** — on a
+> freshly built cluster that returns nothing and looks like a broken scrape.
+> `traefik_entrypoint_requests_total` exists as soon as Traefik is serving anything at all.
 
 ---
 

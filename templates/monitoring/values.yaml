@@ -111,15 +111,44 @@ grafana:
       allow_sign_up: false
     auth.anonymous:
       enabled: false
+  # MEASURED, not estimated. Grafana 12.x runs an embedded apiserver ("unified storage") that
+  # registers ~20 GroupVersions at boot; startup RSS peaks well above steady-state. A 256Mi limit
+  # OOMKills it mid-boot (exit 137) after it has already logged a page of healthy-looking
+  # "Installed APIs for app" lines, so the logs give no hint that memory is the problem — you have
+  # to read .status.containerStatuses[].lastState.terminated.reason to see OOMKilled.
   resources:
     requests:
       cpu: 50m
-      memory: 128Mi
-    limits:
       memory: 256Mi
+    limits:
+      memory: 640Mi
   # Exposed through a Traefik IngressRoute (manifests/grafana-ingress.yaml), not a chart Ingress.
   ingress:
     enabled: false
+
+# The chart ships NO resources for the operator, which puts it in the BestEffort QoS class — the
+# first thing the kubelet evicts under node pressure. The operator is what reconciles the
+# Prometheus, Alertmanager and ServiceMonitor CRDs into real StatefulSets and scrape config, so
+# losing it means your monitoring silently stops adapting while still looking healthy. Measured
+# idle: 2m CPU / 22Mi.
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+  # The operator injects a config-reloader sidecar into the Prometheus and Alertmanager pods, and
+  # the chart ships `resources: {}` for it too. It does not change those pods' QoS class (the main
+  # container's requests already make them Burstable), but an unbounded sidecar can still grow
+  # into the node. Measured idle: 10Mi.
+  prometheusConfigReloader:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        memory: 64Mi
 
 prometheus-node-exporter:
   resources:

@@ -1,0 +1,62 @@
+# Traefik configuration for the K3s-bundled Traefik — ACME (Let's Encrypt) + certificate
+# persistence.
+#
+# K3s installs Traefik from a bundled HelmChart. You do not run `helm upgrade` against it; you
+# create a HelmChartConfig of the same name/namespace and K3s re-reconciles the chart with your
+# values merged in.
+#
+# WHY persistence is not optional
+# -------------------------------
+# The bundled chart mounts /data as an emptyDir. acme.json — the file holding every certificate
+# Traefik has been issued — therefore lives only in the pod's scratch space and is destroyed on
+# every restart. A node reboot, a K3s upgrade, an OOM kill, or editing this very file all restart
+# Traefik, and each restart makes Traefik re-request its certificates. Let's Encrypt allows 5
+# duplicate certificates per week for an identical domain set; after five restarts issuance fails
+# for the rest of the rolling week, with no valid certificate and no log line that says
+# "rate limited" in those words.
+#
+# Verified on K3s v1.36.5+k3s1 with Traefik 3.7.13 (chart traefik-40.1.5+up40.1.0).
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |
+    persistence:
+      enabled: true
+      name: data
+      path: /data
+      size: 128Mi
+      accessMode: ReadWriteOnce
+
+    deployment:
+      replicas: 1
+
+    # A ReadWriteOnce volume cannot attach to two pods at once. The chart's default rolling
+    # update would start the new pod before releasing the old one, so the new pod sits Pending
+    # on volume attach while the old pod waits to be terminated — a deadlock that needs manual
+    # intervention. Recreate accepts a few seconds of downtime instead.
+    updateStrategy:
+      type: Recreate
+
+    # The chart runs Traefik as uid/gid 65532. A freshly provisioned PVC is root-owned, so
+    # without fsGroup Traefik cannot create acme.json. It does not crash — it logs the error and
+    # carries on with no certificate persistence at all, which looks like success until the
+    # first restart. fsGroup makes the kubelet chown the volume to the pod's group on mount.
+    podSecurityContext:
+      fsGroup: 65532
+      fsGroupChangePolicy: OnRootMismatch
+
+    certificatesResolvers:
+      letsencrypt:
+        acme:
+          email: {{LETSENCRYPT_EMAIL}}
+          storage: /data/acme.json
+          httpChallenge:
+            entryPoint: web
+          # While testing, uncomment the staging CA: its rate limits are far looser and its
+          # certificates are untrusted by browsers, which is exactly what you want until the
+          # plumbing is proven. Once a certificate is issued successfully, comment this out and
+          # delete /data/acme.json so Traefik re-issues against production.
+          # caServer: https://acme-staging-v02.api.letsencrypt.org/directory

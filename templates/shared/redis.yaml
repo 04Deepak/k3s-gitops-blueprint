@@ -1,3 +1,57 @@
+# Redis for the shared namespace: queue backend (BullMQ), rate-limit counters, pub/sub.
+#
+# Three things here are deliberate and were all found the hard way on a live cluster:
+#   1. maxmemory-policy defaults to `noeviction`. BullMQ REQUIRES it — with an `allkeys-*`
+#      policy Redis evicts queue keys under memory pressure and jobs vanish with no error.
+#      Only set an eviction policy if this Redis is a pure cache with no queues.
+#   2. requirepass is mandatory. Without it every pod in every namespace can FLUSHALL this
+#      instance, because a ClusterIP Service is reachable cluster-wide.
+#   3. appendonly + a PVC. Without a volume, RDB snapshots land on the container filesystem and
+#      a pod restart silently drops every queued job and rate-limit counter.
+#
+# The password lives in the `redis-auth` Secret, created in setup/02-shared-services.md:
+#   PW=$(openssl rand -base64 24)
+#   kubectl -n shared create secret generic redis-auth \
+#     --from-literal=REDIS_PASSWORD="$PW" \
+#     --from-literal=requirepass.conf="requirepass $PW"
+#
+# Two keys on purpose: redis-server reads the conf fragment (so the password never appears in the
+# process arguments, where any `ps` inside the container would show it), and the apps read
+# REDIS_PASSWORD to build their REDIS_URL.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: shared
+data:
+  redis.conf: |
+    dir /data
+    maxmemory {{REDIS_MAX_MEMORY}}
+    maxmemory-policy {{REDIS_POLICY}}
+
+    # Append-only log, flushed once a second: at most one second of writes is lost on a hard kill.
+    appendonly yes
+    appendfsync everysec
+
+    # RDB snapshots as a second line of defence, on the same volume.
+    save 900 1
+    save 300 10
+
+    # Mounted read-only from the redis-auth Secret.
+    include /etc/redis/auth/requirepass.conf
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: shared
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{REDIS_STORAGE}}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,6 +61,9 @@ metadata:
     app: redis
 spec:
   replicas: 1
+  # A single RWO volume cannot be attached to two pods, so never run old and new side by side.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: redis
@@ -15,17 +72,28 @@ spec:
       labels:
         app: redis
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
       containers:
         - name: redis
           image: redis:7-alpine
-          args:
-            - --maxmemory
-            - "{{REDIS_MAX_MEMORY}}"
-            - --maxmemory-policy
-            - "{{REDIS_POLICY}}"
+          command:
+            - redis-server
+            - /etc/redis/redis.conf
           ports:
             - containerPort: 6379
               name: redis
+          env:
+            # redis-cli picks this up on its own, so the probes below need no password argument
+            # and the password stays out of the process list.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: REDIS_PASSWORD
           resources:
             requests:
               cpu: 50m
@@ -35,18 +103,42 @@ spec:
               memory: 256Mi
           readinessProbe:
             exec:
-              command:
-                - redis-cli
-                - ping
+              command: ["redis-cli", "ping"]
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
             exec:
-              command:
-                - redis-cli
-                - ping
+              command: ["redis-cli", "ping"]
             initialDelaySeconds: 15
             periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/redis/redis.conf
+              subPath: redis.conf
+              readOnly: true
+            - name: auth
+              mountPath: /etc/redis/auth
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-data
+        - name: config
+          configMap:
+            name: redis-config
+        - name: auth
+          secret:
+            secretName: redis-auth
+            items:
+              - key: requirepass.conf
+                path: requirepass.conf
 ---
 apiVersion: v1
 kind: Service

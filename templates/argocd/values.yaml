@@ -1,0 +1,75 @@
+# Helm values for the argo-cd chart, pinned to 10.11.6 (Argo CD v3.5.6).
+#
+# Install with:
+#   helm install argocd argo/argo-cd -n argocd --version 10.11.6 -f output/argocd/values.yaml --wait
+#
+# Three things here exist because the obvious `--set` flags do NOT work on this chart, verified
+# live against 10.11.6:
+#
+#   1. `server.insecure` is NOT a chart value. Passing --set server.insecure=true is accepted by
+#      Helm and silently does nothing. The real knob is configs.params."server.insecure", below.
+#   2. `applicationSet.enabled` does NOT exist either. The only way to stop the ApplicationSet
+#      controller running is replicas: 0. Passing --set applicationSet.enabled=false leaves the
+#      controller running while looking like it worked.
+#   3. Every component ships with `resources: {}`, so out of the box all six Argo CD pods land in
+#      the BestEffort QoS class and are the first things the kubelet evicts under node pressure.
+#      The values below were sized from measured idle usage (~32m CPU / ~151Mi across all pods)
+#      with headroom for sync storms, which is when repo-server and the controller spike.
+
+configs:
+  params:
+    # Traefik terminates TLS, so the Argo CD server speaks plain HTTP behind it.
+    # Without this, Traefik talks HTTPS to a self-signed cert and you get a redirect loop.
+    server.insecure: true
+
+# No SSO/OIDC in this blueprint, so Dex is dead weight. Set this to true and configure
+# configs.cm."dex.config" if you wire up GitHub or Google login later.
+dex:
+  enabled: false
+
+# ApplicationSet generates Applications from templates (per-branch previews, many clusters).
+# A single-cluster, two-app setup does not need it. There is no `enabled` key — replicas: 0
+# is the documented way to switch it off.
+applicationSet:
+  replicas: 0
+
+controller:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+
+server:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      memory: 256Mi
+
+repoServer:
+  # Clones git and renders manifests. Spikes hardest of all the components during a sync,
+  # and Helm-based Applications make it spike harder.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+
+redis:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+notifications:
+  enabled: false

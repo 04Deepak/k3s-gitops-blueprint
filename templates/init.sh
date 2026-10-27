@@ -126,6 +126,68 @@ else
   ok "All tokens replaced successfully"
 fi
 
+# ── Secret-leak guard ──────────────────────────────────────
+# A rendered manifest gets committed to git and read by ArgoCD's deploy key. Any password
+# substituted into it in cleartext is therefore a password in git history, in every clone, and in
+# every CI log that cats the file. This check fails the render rather than letting that happen.
+#
+# Secrets belong in a Kubernetes Secret (created out of band, see setup/02) or in Infisical (see
+# setup/04), referenced from the manifest with valueFrom.secretKeyRef.
+info "Checking that no secret value was rendered into a manifest..."
+LEAKS=0
+for key in "${VAR_KEYS[@]}"; do
+  # Only variables whose NAME says they hold a credential.
+  [[ "$key" =~ (_PASSWORD|_SECRET|_TOKEN|_PASS)$ ]] || continue
+  val="${VARS[$key]}"
+  # Skip empty, obviously-placeholder, and too-short-to-be-real values.
+  [[ -z "$val" || "$val" == CHANGE_ME* || "$val" == your-* || ${#val} -lt 12 ]] && continue
+  # Skip filesystem paths (SSH_KEY and friends point at a file, they are not the secret).
+  [[ "$val" == /* || "$val" == '~'* ]] && continue
+
+  while IFS= read -r hit; do
+    [[ -z "$hit" ]] && continue
+    # Mask the value so the warning itself does not leak it.
+    warn "  ${hit//$val/<$key VALUE IN CLEARTEXT>}"
+    LEAKS=$((LEAKS + 1))
+  done < <(grep -rn -F -- "$val" "$OUTPUT_DIR" 2>/dev/null || true)
+done
+
+if (( LEAKS > 0 )); then
+  echo "" >&2
+  fail "$LEAKS cleartext secret occurrence(s) rendered into output/. Refusing to continue.
+        Replace the {{TOKEN}} in those templates with a secretKeyRef, e.g.
+
+            env:
+              - name: DATABASE_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: my-app-auth
+                    key: DATABASE_URL
+
+        then create the Secret out of band:
+
+            kubectl -n <ns> create secret generic my-app-auth --from-literal=DATABASE_URL='...'"
+fi
+ok "No secret values found in rendered output"
+
+# ── Belt and braces: output/ gets its own .gitignore ───────
+cat > "$OUTPUT_DIR/.gitignore" <<'GITIGNORE'
+# Anything matching these must never reach the devops repo. ArgoCD reads this repo with a deploy
+# key, and a credential committed here is a credential in every clone and every CI log.
+*.env
+!vars.env.example
+.env
+.env.*
+*secret*.local.yaml
+*-credentials.yaml
+*.key
+*.pem
+id_rsa
+id_ed25519
+kubeconfig
+GITIGNORE
+ok "Wrote output/.gitignore"
+
 # ── Summary ────────────────────────────────────────────────
 FILE_COUNT=$(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ')
 echo ""
@@ -139,7 +201,12 @@ fi
 echo "═══════════════════════════════════════════════════════"
 echo ""
 info "Next steps:"
-echo "  1. Review the output/ directory"
-echo "  2. Push output/ as your new devops repo:"
-echo "     cd output && git init && git add -A && git commit -m 'initial infra'"
-echo "  3. Follow the setup guides in docs/ to deploy"
+echo "  1. Review the output/ directory — read it, do not just push it"
+echo "  2. Create the Secrets the manifests reference (setup/02 for postgres-auth and"
+echo "     redis-auth, setup/04 for everything Infisical manages). The manifests hold"
+echo "     references only; no password is rendered into them."
+echo "  3. Push output/ as your devops repo:"
+echo "       cd output && git init && git add -A"
+echo "       git diff --cached -S'password' --stat   # sanity-check before the first commit"
+echo "       git commit -m 'initial infra'"
+echo "  4. Follow the setup guides in setup/ in order (00 to 13)"

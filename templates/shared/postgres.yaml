@@ -10,32 +10,42 @@ data:
 
     echo "Creating application databases and scoped users..."
 
-    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    # The application password arrives as an environment variable from the postgres-auth Secret.
+    # It is NEVER written into this manifest: a rendered manifest gets committed to git, and a
+    # database password in git is a database password in every clone, CI log and ArgoCD deploy key.
+    : "${APP_DB_PASSWORD:?postgres-auth Secret is missing the APP_DB_PASSWORD key}"
+
+    # -v passes them as psql variables, and format() with %I/%L does the quoting, so a password
+    # containing a quote character cannot break out of the statement.
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+         -v appuser="{{DB_USER}}" -v apppw="$APP_DB_PASSWORD" <<-EOSQL
       -- Create staging database
       SELECT 'CREATE DATABASE {{DB_STAGING_NAME}}'
         WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{{DB_STAGING_NAME}}');
       \gexec
 
-      -- Create application user with limited privileges
-      DO \$\$
-      BEGIN
-        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{DB_USER}}') THEN
-          CREATE ROLE {{DB_USER}} WITH LOGIN PASSWORD '{{DB_PASSWORD}}';
-        END IF;
-      END
-      \$\$;
+      -- Create the application role. Done through format()+\gexec rather than a DO block on
+      -- purpose: psql does not substitute :'variables' inside a dollar-quoted \$\$ ... \$\$ body,
+      -- so the password would have been inserted literally as the text ":'apppw'".
+      SELECT format('CREATE ROLE %I WITH LOGIN PASSWORD %L', :'appuser', :'apppw')
+        WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'appuser');
+      \gexec
 
       -- Grant privileges on production database
       GRANT CONNECT ON DATABASE {{DB_NAME}} TO {{DB_USER}};
       \c {{DB_NAME}}
-      GRANT USAGE ON SCHEMA public TO {{DB_USER}};
+      -- CREATE as well as USAGE. Since PostgreSQL 15 the public schema no longer grants CREATE to
+      -- PUBLIC, so USAGE alone lets the role read and write existing tables but not create any.
+      -- Every migration tool (Prisma, Knex, TypeORM, Infisical's own) then dies on its first
+      -- migration with: ERROR: permission denied for schema public.
+      GRANT USAGE, CREATE ON SCHEMA public TO {{DB_USER}};
       ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {{DB_USER}};
       ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {{DB_USER}};
 
       -- Grant privileges on staging database
       \c {{DB_STAGING_NAME}}
       GRANT CONNECT ON DATABASE {{DB_STAGING_NAME}} TO {{DB_USER}};
-      GRANT USAGE ON SCHEMA public TO {{DB_USER}};
+      GRANT USAGE, CREATE ON SCHEMA public TO {{DB_USER}};
       ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {{DB_USER}};
       ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {{DB_USER}};
 
@@ -73,7 +83,16 @@ spec:
             - name: POSTGRES_USER
               value: "{{DB_SUPERUSER}}"
             - name: POSTGRES_PASSWORD
-              value: "{{DB_SUPERUSER_PASSWORD}}"
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: POSTGRES_PASSWORD
+            # Read by init-databases.sh on first boot to create the scoped application role.
+            - name: APP_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-auth
+                  key: APP_DB_PASSWORD
             - name: POSTGRES_DB
               value: "{{DB_NAME}}"
             - name: PGDATA
@@ -91,6 +110,10 @@ spec:
                 - pg_isready
                 - -U
                 - "{{DB_SUPERUSER}}"
+                # Without -d, pg_isready probes a database named after the user, which does not
+                # exist: the probe still passes (the server answered) but logs FATAL every period.
+                - -d
+                - "{{DB_NAME}}"
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
@@ -100,6 +123,10 @@ spec:
                 - pg_isready
                 - -U
                 - "{{DB_SUPERUSER}}"
+                # Without -d, pg_isready probes a database named after the user, which does not
+                # exist: the probe still passes (the server answered) but logs FATAL every period.
+                - -d
+                - "{{DB_NAME}}"
             initialDelaySeconds: 30
             periodSeconds: 30
             timeoutSeconds: 5

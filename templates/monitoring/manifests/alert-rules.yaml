@@ -103,9 +103,27 @@ spec:
 
     - name: {{PROJECT_NAME}}.ingress
       rules:
-        # These two need the Traefik PodMonitor (manifests/traefik-podmonitor.yaml) to be scraping.
+        # All three need the Traefik PodMonitor (manifests/traefik-podmonitor.yaml) to be scraping,
+        # and that object is applied by ArgoCD from the devops repo — NOT by the Helm release.
+        #
+        # Read this before trusting the two below. Verified on Traefik 3.7.13:
+        # Traefik only emits a metric family once something has produced it. On a cluster with no
+        # IngressRoutes yet, /metrics contains ONLY these seven families:
+        #   traefik_config_last_reload_success     traefik_config_reloads_total
+        #   traefik_entrypoint_request_duration_seconds
+        #   traefik_entrypoint_requests_bytes_total  traefik_entrypoint_requests_total
+        #   traefik_entrypoint_responses_bytes_total traefik_open_connections
+        # traefik_service_* appears only after a request is actually routed to a backend service,
+        # and traefik_tls_* only after a certificate is loaded. Until then both alerts below have
+        # no series, so they cannot fire. That is correct behaviour — but it is indistinguishable
+        # from "monitoring is working and everything is fine", which is the dangerous part.
+        # TraefikConfigReloadFailing exists to give this group a signal that is always present.
         - alert: IngressHigh5xxRate
-          expr: sum(rate(traefik_service_requests_total{code=~"5.."}[5m])) / sum(rate(traefik_service_requests_total[5m])) > 0.05
+          # Deliberately uses entrypoint metrics, not traefik_service_requests_total: entrypoint
+          # series exist as soon as Traefik serves anything, so this alert is live from day one.
+          # It also catches 5xx that Traefik itself generates (bad route, no healthy backend),
+          # which service-level metrics miss entirely because no service was ever reached.
+          expr: sum(rate(traefik_entrypoint_requests_total{code=~"5.."}[5m])) / sum(rate(traefik_entrypoint_requests_total[5m])) > 0.05
           for: 5m
           labels:
             severity: critical
@@ -113,9 +131,25 @@ spec:
             summary: "More than 5% of requests through Traefik are returning 5xx"
 
         - alert: TLSCertificateExpiringSoon
+          # NOTE: traefik_tls_certs_not_after has no series until Traefik has loaded at least one
+          # certificate. Confirm it is populated BEFORE relying on this alert:
+          #   curl -s "http://<prometheus-ip>:9090/api/v1/query" \
+          #     --data-urlencode 'query=traefik_tls_certs_not_after'
+          # If that returns an empty result while HTTPS works, this alert is silent, not healthy.
           expr: (traefik_tls_certs_not_after - time()) / 86400 < 14
           for: 1h
           labels:
             severity: critical
           annotations:
             summary: "TLS certificate {{ $labels.cn }} expires in under 14 days (Let's Encrypt renewal failing?)"
+
+        - alert: TraefikConfigReloadFailing
+          # Always has series whenever the PodMonitor is scraping, so it doubles as proof that
+          # this whole alert group is wired up. A failed reload means Traefik is still serving the
+          # last good config and silently ignoring your newest IngressRoute.
+          expr: traefik_config_last_reload_success == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Traefik has not successfully reloaded its configuration — new IngressRoutes are being ignored"

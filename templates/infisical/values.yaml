@@ -1,0 +1,62 @@
+# Helm values for infisical/infisical-standalone, pinned to 1.11.1 (Infisical v0.167.0).
+#
+#   helm install infisical infisical/infisical-standalone -n infisical \
+#     --version 1.11.1 -f output/infisical/values.yaml --wait
+#
+# IMPORTANT — chart choice. There are two Infisical charts in that repo and they are not
+# interchangeable:
+#
+#   infisical/infisical            0.4.2  (app 1.17.0)  LEGACY. MongoDB-backed. Its env mechanism
+#                                                       is the top-level `backendEnvironmentVariables`
+#                                                       map, it has no `backend.resources` and no
+#                                                       `frontend` key at all. Values written for
+#                                                       the modern chart are silently discarded and
+#                                                       you get an Infisical with an empty
+#                                                       ENCRYPTION_KEY and no database.
+#   infisical/infisical-standalone 1.11.1 (app v0.167.0) CURRENT. PostgreSQL-backed. This one.
+#
+# All configuration arrives through a Kubernetes Secret named by `kubeSecretRef`, so no credential
+# is ever written into this file. Create it before installing — see setup/04.
+
+infisical:
+  # The chart default is 2. One is right for a single-node cluster; raise it when you add nodes.
+  replicaCount: 1
+
+  # Every key in this Secret becomes an environment variable on the pod. Required keys:
+  #   ENCRYPTION_KEY     openssl rand -hex 16        (exactly 32 hex characters)
+  #   AUTH_SECRET        openssl rand -base64 32
+  #   DB_CONNECTION_URI  postgresql://USER:PW@postgres.shared.svc.cluster.local:5432/{{DB_NAME}}
+  #   REDIS_URL          redis://:PW@redis.shared.svc.cluster.local:6379
+  #   SITE_URL           https://{{INFISICAL_DOMAIN}}
+  kubeSecretRef: "infisical-secrets"
+
+  # The chart ships `limits.memory: 1000Mi` and `requests.cpu: 350m` and nothing else, which leaves
+  # the pod with no memory request. Set all four so it lands in the Burstable QoS class.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# Use the PostgreSQL from setup/02 rather than the bundled Bitnami subchart. Both default to
+# enabled: true, so leaving these out gives you a second PostgreSQL and a second Redis.
+postgresql:
+  enabled: false
+
+redis:
+  enabled: false
+
+# Traefik is the ingress controller on K3s, so this chart's own ingress stays off and the Traefik
+# IngressRoute in templates/admin-ingress/infisical-ingress.yaml handles it instead (setup/07).
+#
+# READ THE NESTED KEY CAREFULLY. The bundled ingress-nginx subchart is gated on
+# `ingress.nginx.enabled`, NOT on `ingress.enabled`. Setting only `ingress.enabled: false` installs
+# a complete nginx ingress controller anyway. Verified live: it came up with a LoadBalancer Service
+# stuck on <pending> and its svclb DaemonSet pod stuck Pending 0/2 forever, because Traefik already
+# holds host ports 80 and 443. You get a permanently broken pod and a dead Service.
+ingress:
+  enabled: false
+  nginx:
+    enabled: false

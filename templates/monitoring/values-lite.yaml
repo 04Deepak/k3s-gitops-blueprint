@@ -3,19 +3,33 @@
 #   valueFiles:
 #     - $values/monitoring/values.yaml
 #     - $values/monitoring/values-lite.yaml
-# Later files win. The numbers are starting estimates, not measurements.
+# Later files win. The Prometheus numbers are starting estimates; the Grafana numbers are
+# measured (see the note on grafana below - do not lower them).
 # What it saves: fewer samples (60s scrape), shorter history, smaller limits, no Alertmanager disk.
 prometheus:
   prometheusSpec:
     scrapeInterval: 60s
     evaluationInterval: 60s
     retention: 3d
+    # MEASURED: 348Mi RSS with 108,835 head series from 13 targets, on a single-node cluster
+    # running only ArgoCD, Infisical, Postgres, Redis and two app Deployments. A 512Mi limit (the
+    # earlier value here) leaves 164Mi of headroom, and Prometheus head memory scales with series
+    # count, not with how many pods you think you have — most of those 108k series come from
+    # cadvisor and kube-state-metrics, which grow with every container you add.
+    #
+    # That makes 512Mi the worst kind of wrong: it does not fail at install, it fails an hour or a
+    # week later when series cross the line, and an OOMKilled Prometheus loses its entire head
+    # block (up to 2h of unwritten data) on every restart.
+    #
+    # Lowering scrapeInterval and retention does NOT reduce head memory much — retention affects
+    # disk, and scrape interval affects samples per series, not the number of series. To actually
+    # shrink Prometheus you must drop series; see the metricRelabelings block below.
     resources:
       requests:
         cpu: 100m
-        memory: 256Mi
+        memory: 384Mi
       limits:
-        memory: 512Mi
+        memory: 768Mi
     storageSpec:
       volumeClaimTemplate:
         spec:
@@ -25,16 +39,42 @@ prometheus:
             requests:
               storage: 5Gi
 
+# Grafana is deliberately NOT trimmed here. The obvious saving is a lower memory limit, and it
+# does not work: Grafana 12.x OOMKills during startup below roughly 512Mi regardless of how little
+# it serves afterwards, because the embedded apiserver's boot cost is fixed. A 192Mi limit here
+# produced a permanent CrashLoopBackOff on a 16GB node with 89% of memory free. If you need the
+# memory back, set `grafana.enabled: false` and run Grafana elsewhere, or point an external
+# Grafana at this Prometheus — do not shave the limit.
 grafana:
   resources:
     requests:
       cpu: 25m
-      memory: 96Mi
+      memory: 256Mi
     limits:
-      memory: 192Mi
+      memory: 640Mi
 
 # Alertmanager is small but needs a volume; the alerts themselves are what matters.
 # Silences are lost on restart without a volume, which is acceptable on a small server.
 alertmanager:
   alertmanagerSpec:
     storage: null
+
+# ── The real lever for a small server: fewer series, not less memory ──────────────────────────
+# cadvisor is usually the largest single source of head series. These drops are safe for most
+# small deployments — they remove per-container breakdowns that the stock dashboards do not use.
+# Uncomment and re-measure with:
+#   curl -s "http://<prometheus-pod-ip>:9090/api/v1/status/tsdb" | python3 -m json.tool
+#
+# kubelet:
+#   serviceMonitor:
+#     cAdvisorMetricRelabelings:
+#       - sourceLabels: [__name__]
+#         action: drop
+#         regex: container_(network_tcp_usage_total|network_udp_usage_total|tasks_state|memory_failures_total|blkio_device_usage_total)
+#       - sourceLabels: [__name__]
+#         action: drop
+#         regex: container_(fs_.*|spec_.*)
+#
+# kube-state-metrics is the other big one. If you do not use the generic-resource dashboards:
+# kube-state-metrics:
+#   metricLabelsAllowlist: []

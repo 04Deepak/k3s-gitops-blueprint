@@ -12,12 +12,23 @@ Go to your DNS provider (GoDaddy, Cloudflare, Route53, etc.) and create **A reco
 
 | Record | Type | Name | Value | TTL |
 |--------|------|------|-------|-----|
-| App (prod) | A | `app` | `{{SERVER_IP}}` | 600 |
-| App (staging) | A | `staging` | `{{SERVER_IP}}` | 600 |
-| ArgoCD | A | `argocd` | `{{SERVER_IP}}` | 600 |
-| Infisical | A | `infisical` | `{{SERVER_IP}}` | 600 |
+| App (prod) | A | `app` | `{{SERVER_IP}}` | 300 |
+| App (staging) | A | `staging` | `{{SERVER_IP}}` | 300 |
+| ArgoCD | A | `argocd` | `{{SERVER_IP}}` | 300 |
+| Infisical | A | `infisical` | `{{SERVER_IP}}` | 300 |
+| Grafana | A | `grafana` | `{{SERVER_IP}}` | 300 |
 
-> If using Cloudflare, set proxy status to **DNS only** (grey cloud) — Traefik needs direct TCP access for Let's Encrypt ACME challenges.
+Use a short TTL while you are setting up, then raise it once certificates are issued.
+
+> **Cloudflare users:** set proxy status to **DNS only** (grey cloud). Traefik needs direct TCP
+> access for the ACME challenge, and an orange-cloud record breaks it.
+
+> **Do not add AAAA records.** Your VPS probably has a global IPv6 address, but K3s runs
+> single-stack IPv4 by default, so Traefik never listens on IPv6. An AAAA record sends every
+> IPv6-capable browser to a port nothing is listening on — they get a connection refused while
+> IPv4-only visitors see a perfectly healthy site. That is a miserable bug to track down. Check
+> what your server has with `ip -6 addr show scope global`; having an address is not the same as
+> serving on it.
 
 **Verify DNS propagation:**
 
@@ -45,31 +56,65 @@ K3s's bundled Traefik supports automatic Let's Encrypt certificates via the ACME
 
 ## Step 3: Configure Traefik for Let's Encrypt
 
-K3s configures Traefik via a HelmChartConfig resource. Create it:
+### First, the thing that will bite you
+
+K3s's bundled Traefik mounts `/data` as an **emptyDir**. Check your own cluster:
 
 ```bash
-cat <<'EOF' | kubectl apply -f -
-apiVersion: helm.cattle.io/v1
-kind: HelmChartConfig
-metadata:
-  name: traefik
-  namespace: kube-system
-spec:
-  valuesContent: |
-    additionalArguments:
-      - "--certificatesresolvers.letsencrypt.acme.email=your@email.com"
-      - "--certificatesresolvers.letsencrypt.acme.storage=/data/acme.json"
-      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
-EOF
+kubectl -n kube-system get deploy traefik -o jsonpath='{.spec.template.spec.volumes}'; echo
 ```
 
-> **Replace `your@email.com`** with a real email — Let's Encrypt sends expiry warnings to it.
+If you see `{"emptyDir":{},"name":"data"}`, then `acme.json` — the file holding every certificate
+Traefik has been issued — **lives only in the pod's memory-backed scratch space and is destroyed
+every time the pod restarts.**
 
-Wait for Traefik to restart:
+That is not a rare event. A node reboot, a K3s upgrade, an OOM kill, or editing this very
+HelmChartConfig all restart Traefik. Each restart makes Traefik request its certificates again,
+and Let's Encrypt enforces a limit of **5 duplicate certificates per week** for an identical set
+of domains. Five restarts in a week and issuance starts failing — for a full week, with no valid
+certificate, and nothing in the Traefik log that says "you are rate limited" in those words.
+
+So configure persistence **and** the resolver together, in one HelmChartConfig. `init.sh` renders
+this for you from `templates/shared/traefik-config.yaml`, using `LETSENCRYPT_EMAIL` from
+`vars.env`:
 
 ```bash
-kubectl -n kube-system rollout status deploy/traefik
+cat output/shared/traefik-config.yaml     # read it before applying
+kubectl apply -f output/shared/traefik-config.yaml
 ```
+
+> **Set `LETSENCRYPT_EMAIL` in `vars.env` first** and re-run `./init.sh`. Use a mailbox somebody reads — Let's Encrypt sends expiry warnings
+> there, and it is the only notice you get if auto-renewal silently stops.
+
+K3s re-reconciles the bundled chart when this changes. Give it a minute:
+
+```bash
+sleep 45
+kubectl -n kube-system rollout status deploy/traefik --timeout=180s
+```
+
+**Verify persistence actually took:**
+
+```bash
+kubectl -n kube-system get deploy traefik -o jsonpath='{.spec.template.spec.volumes}'; echo
+kubectl -n kube-system get pvc
+kubectl -n kube-system exec deploy/traefik -- sh -c 'touch /data/.w && echo writable && rm /data/.w'
+```
+
+Expected: the `data` volume is now a `persistentVolumeClaim`, a `traefik` PVC is `Bound`, and the
+write test prints `writable`. If the write test fails, `fsGroup` did not apply.
+
+> **Use the staging ACME server while you experiment.** Its rate limits are far looser and its
+> certificates are untrusted by browsers, which is exactly what you want until the plumbing is
+> proven. The `caServer:` line is already in `templates/shared/traefik-config.yaml`, commented
+> out — uncomment it, re-run `./init.sh`, re-apply, and confirm a certificate is issued. Then
+> comment it out again, re-apply, and delete `/data/acme.json` so Traefik re-issues against
+> production:
+>
+> ```bash
+> kubectl -n kube-system exec deploy/traefik -- rm -f /data/acme.json
+> kubectl -n kube-system rollout restart deploy/traefik
+> ```
 
 ## Step 4: Apply IngressRoutes
 
@@ -207,7 +252,19 @@ kubectl -n kube-system logs -l app.kubernetes.io/name=traefik --tail=50 | grep -
 Common causes:
 - **DNS not propagated:** `dig +short {{DOMAIN}}` must return your server IP
 - **Port 80 blocked:** Let's Encrypt HTTP-01 challenge needs port 80 open
-- **Rate limited:** Let's Encrypt limits 5 duplicate certs per week. Wait or use a different domain
+- **Rate limited:** Let's Encrypt allows 5 duplicate certificates per week for an identical set of
+  domains. There is no way to lift it and no reset button — you wait out the rolling week. This is
+  the failure mode that non-persistent `acme.json` walks you into, because every Traefik restart
+  spends one of the five. The log line is a 429 from `acme-v02.api.letsencrypt.org`; it does not
+  use the phrase "rate limit", so grep for `429` or `too many`:
+
+  ```bash
+  kubectl -n kube-system logs -l app.kubernetes.io/name=traefik --tail=200 \
+    | grep -iE '429|too many|urn:ietf:params:acme:error'
+  ```
+
+  If you are already rate limited, add a temporary extra subdomain to the IngressRoute so the
+  certificate covers a *different* domain set, or switch to the staging CA until the week rolls.
 - **Wrong email:** The `acme.email` must be valid
 
 ### "connection refused" on port 443
@@ -221,12 +278,21 @@ ss -tlnp | grep ':443'
 
 ### Where are certificates stored?
 
-Inside the Traefik pod at `/data/acme.json`. K3s persists this via a PVC or hostPath.
+Inside the Traefik pod at `/data/acme.json` — **and by default K3s does not persist it.** The
+bundled chart mounts `/data` as an emptyDir, so every certificate Traefik holds is destroyed when
+the pod restarts. Step 3 configures a PVC to fix this; verify yours actually has one:
 
 ```bash
-# Check on the server
-ls -la /var/lib/rancher/k3s/server/manifests/
+kubectl -n kube-system get deploy traefik -o jsonpath='{.spec.template.spec.volumes}'; echo
+kubectl -n kube-system exec deploy/traefik -- ls -l /data/acme.json
 ```
+
+You want to see `persistentVolumeClaim` in the first command and a file of a few KB in the second.
+A `0`-byte or missing `acme.json` after a successful issuance means Traefik could not write to the
+volume — almost always the `fsGroup` from Step 3 being absent, leaving the PVC root-owned.
+
+Nothing useful lives in `/var/lib/rancher/k3s/server/manifests/` for this — that directory holds
+K3s's bundled chart definitions, not certificate data.
 
 ### Certificate expiry monitoring
 

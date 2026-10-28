@@ -48,6 +48,29 @@ spec:
       fsGroup: 65532
       fsGroupChangePolicy: OnRootMismatch
 
+    # HTTP -> HTTPS redirect for every route.
+    #
+    # MIND THE NESTING. The key is ports.web.HTTP.redirections — the `http:` level is easy to
+    # miss, and leaving it out is silent: Helm accepts `ports.web.redirections`, `helm get values`
+    # echoes it back exactly as you wrote it, the chart renders no redirect flag at all, and
+    # plain HTTP keeps serving. Verified on chart traefik-40.1.5+up40.1.0. Confirm the flags
+    # actually exist after applying:
+    #   kubectl -n kube-system get deploy traefik \
+    #     -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{@}{"\n"}{end}' | grep -i redirect
+    # You want three lines: entryPoint.to, .scheme and .permanent. No output means the nesting
+    # is wrong, not that the chart lacks the feature.
+    #
+    # This does NOT break ACME renewals: Traefik serves the /.well-known/acme-challenge/ path
+    # from a higher-priority router than the redirect.
+    ports:
+      web:
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
+
     certificatesResolvers:
       letsencrypt:
         acme:
@@ -55,6 +78,17 @@ spec:
           storage: /data/acme.json
           httpChallenge:
             entryPoint: web
+          # FIRST-ISSUANCE RACE, seen live: Traefik asks for certificates about 2 seconds after
+          # it starts, but K3s's klipper load-balancer (svclb) needs longer than that to point
+          # host port 80 at the new pod. If a certificate is pending during that window, Let's
+          # Encrypt's validator gets "Connection refused" and the attempt fails:
+          #   urn:ietf:params:acme:error:connection :: <ip>: Fetching
+          #   http://<host>/.well-known/acme-challenge/<token>: Connection refused
+          # Port 80 is wide open by then, which makes the error badly misleading. Traefik backs
+          # off and does not retry promptly. The fix is simply to retry once things have settled:
+          #   kubectl delete -f <your ingressroutes>.yaml && sleep 10 && kubectl apply -f <...>
+          # It only affects issuance, never renewal of a stored certificate — which is one more
+          # reason the persistence above matters.
           # While testing, uncomment the staging CA: its rate limits are far looser and its
           # certificates are untrusted by browsers, which is exactly what you want until the
           # plumbing is proven. Once a certificate is issued successfully, comment this out and

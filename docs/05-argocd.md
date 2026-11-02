@@ -285,3 +285,62 @@ In this setup, the following are typically unmanaged:
 - Namespace resources themselves (if `CreateNamespace=true` isn't set)
 
 **Recommendation:** Track everything possible under an ArgoCD Application. Unmanaged resources are the "git says one thing, cluster says another" class of problems.
+
+## Adopting a Workload That Is Already Running
+
+The previous section's recommendation — track everything — has a sharp edge when the thing you
+are about to track is already serving traffic. Registering an Application with `selfHeal: true`
+does not merge git into the cluster. It makes the cluster **become** git, and anything the live
+object has that your manifest does not declare is removed.
+
+The field people forget is `envFrom`. A Deployment written from memory will carry the image, the
+ports, the probes and the replica count, and silently omit:
+
+```yaml
+          envFrom:
+            - secretRef:
+                name: backend-secrets
+```
+
+Apply that and the pods restart with an empty environment. The app comes up, fails to find its
+database URL, and crashloops — and because the manifest "looks right", the cause is not where
+anyone looks first.
+
+**So diff before you adopt, every time:**
+
+```bash
+kubectl diff -f apps/backend/
+```
+
+Nothing but metadata noise (`generation`, `resourceVersion`) means adoption is a no-op and no pod
+will restart. Anything else is a change `selfHeal` is about to make for you — read each one and
+decide whether git or the cluster is right. Scaling a replica count is fine. Dropping a volume
+mount or an `envFrom` is a production incident with a three-minute fuse.
+
+Two ways this check lies to you:
+
+- **It exits non-zero when it finds differences.** That is its normal behaviour, not an error.
+  Do not wrap it in something that treats non-zero as "could not run".
+- **An empty result is not always a clean diff.** If `kubectl` fails to parse a file it writes to
+  stderr and produces no stdout, so a script doing `[ -z "$OUT" ] && echo "no changes"` reports
+  success for manifests it never compared. (The way this is usually triggered: copying manifests
+  from a Mac with `tar`, which brings `._`-prefixed AppleDouble files along. `kubectl` tries to
+  parse one as a manifest and dies on `control characters are not allowed`. `COPYFILE_DISABLE=1`
+  stops it.) Capture both streams, and check the exit status rather than the output length.
+
+### One-shot Jobs do not belong in the Application directory
+
+A database seed, a backfill, a one-time migration — these are hooks, not manifests. Put a plain
+Job in the directory an Application watches and `selfHeal` will keep re-creating it. Use a
+`PostSync` hook (see above), or run it once with `kubectl create job` from outside the directory.
+
+If the Job runs a script that self-guards on being the entry point, give it an **absolute path**:
+
+```yaml
+command: ["/app/node_modules/.bin/tsx", "/app/src/seed.ts"]   # not "src/seed.ts"
+```
+
+A guard like `import.meta.filename === process.argv[1]` compares a resolved absolute path against
+whatever you passed. Pass a relative path and the comparison can fail, the script does nothing,
+and the Job **exits 0 and reports Complete**. A seed that silently seeds nothing is worse than
+one that fails.

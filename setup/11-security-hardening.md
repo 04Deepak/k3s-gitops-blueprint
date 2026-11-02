@@ -392,6 +392,71 @@ An explicit `env` entry in the Deployment YAML takes precedence over `envFrom` a
 
 ---
 
+## Part 5: Scripts That Handle Secrets
+
+Most credentials in a cluster are not typed into a UI; they are moved around by a script somebody
+wrote in a hurry. Three rules, each from a real failure.
+
+**Never pass a secret in `argv`.** It is visible in `ps`, in your shell history, and in the
+transcript of whatever session ran it. Read from stdin:
+
+```bash
+read -rsp 'value: ' V && printf '%s' "$V" | ./set-secret.sh PROJECT ENV KEY; unset V
+```
+
+**Never end a value-producing pipeline with a line-oriented tool.** `sed`, `awk` and friends
+append a trailing newline, and a reader doing `sys.stdin.read()` or `cat` keeps it:
+
+```bash
+# WRONG — stores "<password>\n". bcrypt will hash the newline, and nothing the user ever
+# copies out of the vault will match.
+openssl rand -base64 18 | tr -d '\n=' | sed 's/$/#9/' | ./set-secret.sh ...
+
+# RIGHT — $(...) strips trailing newlines, printf adds none.
+P="$(openssl rand -base64 18 | tr -d '\n=')#9"
+printf '%s' "$P" | ./set-secret.sh ...
+```
+
+This one is invisible until login fails, and then it looks like a wrong password rather than a
+wrong byte. Check the stored length against the intended length before anything depends on it.
+
+**A confirmation prompt must not discard what the user already typed.** Strict equality looks
+careful and is the opposite:
+
+```bash
+# WRONG — a stray backslash, a capital Y, or a trailing space throws away everything the
+# operator just typed, including a secret the provider displays exactly once.
+read -rp "proceed? [y/N] " OK
+[ "$OK" != "y" ] && exit 1
+
+# RIGHT — normalise, accept the obvious spellings, and re-ask instead of exiting.
+while true; do
+  read -rp "proceed? [y/n] " OK
+  OK=$(printf '%s' "${OK:-}" | tr -d '[:space:]\\' | tr '[:upper:]' '[:lower:]')
+  case "$OK" in
+    y|yes) break ;;
+    n|no)  echo "nothing written"; exit 1 ;;
+    *)     echo "  please answer y or n" ;;
+  esac
+done
+```
+
+The cost of a mis-read "no" is not an extra keystroke. It is re-rotating a credential because the
+only copy of it was in a prompt that threw it away.
+
+**And guard for a terminal.** A script with `read -rp` in it hangs forever under
+`ssh host ./script.sh`, because there is no tty and nothing to read from:
+
+```bash
+if [ ! -t 0 ]; then
+  echo "This script prompts for values, so it needs a terminal." >&2
+  echo "Run:  ssh -t host ./script.sh" >&2
+  exit 1
+fi
+```
+
+---
+
 ## Security Checklist
 
 Run through before calling the deployment production-ready:
@@ -413,6 +478,13 @@ Run through before calling the deployment production-ready:
 - [ ] Nginx security headers configured (X-Frame-Options, HSTS, CSP)
 - [ ] Database users scoped with CONNECTION LIMIT
 - [ ] No default/seeded passwords active in production
+- [ ] Every `.default(` in the app's env schema checked — a value that works on a laptop
+      (`localhost:1025`, `http://localhost:3000`) passes validation and fails at use time
+- [ ] Bootstrap passwords removed from the vault once the account owner has changed them
+      (they sync into the app's Secret and reach every pod's environment)
+- [ ] Object storage credentials scoped to one bucket, not account-wide
+- [ ] Backup credentials stored OUTSIDE the vault they are meant to restore (see 09-backup.md)
+- [ ] No secret ever passed in `argv`
 
 ---
 

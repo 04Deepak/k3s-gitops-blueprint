@@ -118,11 +118,12 @@ See [`templates/vars.env`](templates/vars.env) for the full variable list with d
 | 06 | [CI/CD Setup](setup/06-cicd-setup.md) | Automated build + deploy pipeline |
 | 07 | [TLS & DNS](setup/07-tls-dns.md) | HTTPS with Let's Encrypt |
 | 08 | [PgBouncer](setup/08-pgbouncer.md) | Connection pooling active |
-| 09 | [Backup](setup/09-backup.md) | Automated S3 backups running |
+| 09 | [Backup](setup/09-backup.md) | Automated S3 backups of the app database **and the vault** |
 | 10 | [Scaling](setup/10-scaling.md) | HPA + PDB configured |
 | 11 | [Security Hardening](setup/11-security-hardening.md) | VPN, firewall, access control |
 | 12 | [Monitoring](setup/12-monitoring.md) | Prometheus, Grafana, Slack alerts |
 | 13 | [Logging](setup/13-logging.md) | Loki + Alloy (optional, experimental) |
+| 14 | [Object Storage](setup/14-object-storage.md) | S3/R2 uploads, CORS, and both halves verified |
 
 ## Overlay
 

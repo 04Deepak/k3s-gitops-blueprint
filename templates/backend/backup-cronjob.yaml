@@ -1,3 +1,16 @@
+# Daily pg_dump -> gzip -> S3.
+#
+# Two things here are not obvious and both were found the hard way:
+#
+# 1. It dumps the INFISICAL database as well as the application one. Infisical is where every
+#    other secret lives, and on a single-node cluster its database sits on the same local-path
+#    volume as everything else. Backing up the app database and not the vault means a node loss
+#    is recoverable for your data and permanent for your credentials.
+#
+# 2. The S3 credentials come from `backup-secrets`, which is a PLAIN Secret created out of band
+#    (see backup-secrets.yaml) and NOT an InfisicalSecret. A backup job that reads its
+#    credentials from Infisical cannot run when Infisical is what you lost, which is the one
+#    moment you need it.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -25,19 +38,49 @@ spec:
                 - /bin/sh
                 - -c
                 - |
+                  set -eu
                   TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-                  FILENAME="{{DB_NAME}}_${TIMESTAMP}.sql.gz"
-                  echo "Starting backup: ${FILENAME}"
-                  pg_dump "$DATABASE_URL" | gzip > /backup/${FILENAME}
-                  echo "${FILENAME}" > /backup/LATEST
-                  ls -lh /backup/${FILENAME}
-                  echo "Backup complete"
+                  : > /backup/MANIFEST
+
+                  dump() {
+                    NAME=$1
+                    URL=$2
+                    if [ -z "$URL" ]; then
+                      echo "SKIP ${NAME}: no connection URL set"
+                      return 0
+                    fi
+                    FILE="${NAME}_${TIMESTAMP}.sql.gz"
+                    echo "dumping ${NAME} -> ${FILE}"
+                    pg_dump "$URL" | gzip > "/backup/${FILE}"
+                    # `pg_dump | gzip` hides pg_dump's exit status, so a dump that dies halfway
+                    # still produces a perfectly valid, small .gz that uploads without complaint.
+                    # pg_dump writes this trailer only after a complete dump; check for it.
+                    if ! gzip -dc "/backup/${FILE}" | tail -5 | grep -q "PostgreSQL database dump complete"; then
+                      echo "FAILED ${NAME}: dump is truncated, refusing to upload it"
+                      exit 1
+                    fi
+                    echo "${FILE}" >> /backup/MANIFEST
+                    ls -lh "/backup/${FILE}"
+                  }
+
+                  dump "{{DB_NAME}}" "${DATABASE_URL:-}"
+                  # The vault. Losing this loses every credential the cluster needs to come back.
+                  dump "infisical" "${INFISICAL_DATABASE_URL:-}"
+
+                  echo "dumps complete:"
+                  cat /backup/MANIFEST
               env:
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef:
                       name: backup-secrets
                       key: DATABASE_URL
+                - name: INFISICAL_DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-secrets
+                      key: INFISICAL_DATABASE_URL
+                      optional: true
               volumeMounts:
                 - name: backup-volume
                   mountPath: /backup
@@ -55,12 +98,14 @@ spec:
                 - /bin/sh
                 - -c
                 - |
-                  FILENAME=$(cat /backup/LATEST)
-                  echo "Uploading ${FILENAME} to s3://{{S3_BACKUP_BUCKET}}/daily/"
-                  aws s3 cp "/backup/${FILENAME}" \
-                    "s3://{{S3_BACKUP_BUCKET}}/daily/${FILENAME}" \
-                    --region {{AWS_REGION}}
-                  echo "Upload complete"
+                  set -eu
+                  while read -r FILENAME; do
+                    echo "uploading ${FILENAME} to s3://{{S3_BACKUP_BUCKET}}/daily/"
+                    aws s3 cp "/backup/${FILENAME}" \
+                      "s3://{{S3_BACKUP_BUCKET}}/daily/${FILENAME}" \
+                      --region {{AWS_REGION}}
+                  done < /backup/MANIFEST
+                  echo "upload complete"
               env:
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:

@@ -201,6 +201,67 @@ Causes:
 - **Database not reachable:** Test connectivity from the pod
 - **Port conflict:** Ensure the container port matches what the app listens on
 
+### CrashLoopBackOff, and three ReplicaSets' worth of pods
+
+A rolling update does not retire the previous revision until the new pods go **Ready**. If they
+never do, each `kubectl apply` or `rollout restart` stacks another ReplicaSet on top, and you end
+up reading logs from a pod that is two revisions out of date while chasing a bug you already
+fixed.
+
+```bash
+kubectl -n {{NAMESPACE}} get rs -l app={{PROJECT_NAME}}-backend
+```
+
+More than one with a non-zero desired count means you are looking at a pile-up. Clear every
+revision at once — `rollout restart` would just add a fourth:
+
+```bash
+kubectl -n {{NAMESPACE}} scale deploy/{{PROJECT_NAME}}-backend --replicas=0
+kubectl -n {{NAMESPACE}} wait --for=delete pod -l app={{PROJECT_NAME}}-backend --timeout=90s
+kubectl -n {{NAMESPACE}} scale deploy/{{PROJECT_NAME}}-backend --replicas=1
+```
+
+### The app refuses to start against an empty database
+
+Some applications check for a bootstrap row — an organization, a tenant, a default admin — and
+exit rather than run half-configured:
+
+```
+No organization found - run `npm run seed` before starting the API
+```
+
+This is correct behaviour and no amount of restarting fixes it. Seed it once, as a Job, from
+**outside** the directory ArgoCD watches — a plain Job inside it gets re-created forever by
+`selfHeal`. See the adoption notes in [docs/05-argocd.md](../docs/05-argocd.md).
+
+Read the seed before you run it against a real database. The ones worth running are idempotent
+(`findOne` then skip, or `findOneAndUpdate`), and the ones worth being careful about are not.
+
+### A config value that defaults to something that works in development
+
+Check every setting the app reads for a default that is only correct on a laptop. The classic:
+
+```js
+SMTP_HOST: z.string().default('localhost'),
+SMTP_PORT: z.coerce.number().default(1025),
+```
+
+That is a dev mailbox. In the cluster there is nothing on `localhost:1025`, so the schema
+validates, the app starts healthy, the health check passes — and **every email fails at send
+time**, which is the first time anyone finds out. Invites and password resets are usually where
+it bites, and invite tokens are normally stored hashed, so a failed invite email cannot be
+recovered from the database either.
+
+Grep the env schema for `.default(` before going live and confirm every one of them is correct
+in production, not merely present:
+
+```bash
+kubectl -n {{NAMESPACE}} exec deploy/{{PROJECT_NAME}}-backend -- \
+  node -e 'const n=require("net").connect({host:process.env.SMTP_HOST,port:+process.env.SMTP_PORT});
+           n.on("connect",()=>{console.log("reachable");n.end()});
+           n.on("error",e=>console.log("UNREACHABLE:",e.code))'
+```
+
 ### Service not reachable
 
 ```bash
